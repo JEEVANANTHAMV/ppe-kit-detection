@@ -1,7 +1,7 @@
 # Python In-built packages
 from pathlib import Path
 import PIL
-
+import cv2
 # External packages
 import streamlit as st
 
@@ -11,31 +11,31 @@ import helper
 
 # Setting page layout
 st.set_page_config(
-    page_title="Object Detection using YOLOv8",
+    page_title="L&T PES Object Detection using YOLOv8",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # Main page heading
-st.title("Object Detection And Tracking using YOLOv8")
+st.title("L&T PES Object Detection And Tracking using YOLOv8")
 
 # Sidebar
 st.sidebar.header("ML Model Config")
 
 # Model Options
-model_type = st.sidebar.radio(
-    "Select Task", ['Detection', 'Segmentation'])
+# model_type = st.sidebar.radio(
+#     "Select Task", ['Detection', 'Segmentation'])
 
 confidence = float(st.sidebar.slider(
     "Select Model Confidence", 25, 100, 40)) / 100
 
 # Selecting Detection Or Segmentation
-if model_type == 'Detection':
-    model_path = Path(settings.DETECTION_MODEL)
-elif model_type == 'Segmentation':
-    model_path = Path(settings.SEGMENTATION_MODEL)
-
+# if model_type == 'Detection':
+#     model_path = Path(settings.DETECTION_MODEL)
+# elif model_type == 'Segmentation':
+#     model_path = Path(settings.SEGMENTATION_MODEL)
+model_path = settings.DETECTION_MODEL
 # Load Pre-trained ML Model
 try:
     model = helper.load_model(model_path)
@@ -95,7 +95,80 @@ if source_radio == settings.IMAGE:
                     st.write("No image is uploaded yet!")
 
 elif source_radio == settings.VIDEO:
-    helper.play_stored_video(confidence, model)
+    print("here")
+    source_video = st.sidebar.file_uploader(
+        "Choose a video...", type=("mp4", "avi", "mov", "wmv"))
+
+    col1, col2 = st.columns(2)
+    print(col1, "col1")
+    with col1:
+        try:
+            if source_video is None:
+                default_video_path = str(settings.DEFAULT_VIDEO)
+                st.video(default_video_path)
+            else:
+                st.video(source_video)
+        except Exception as ex:
+            st.error("Error occurred while opening the video.")
+            st.error(ex)
+
+    with col2:
+        if source_video is None:
+            default_detected_video_path = str(settings.DEFAULT_DETECT_VIDEO)
+            st.video(default_detected_video_path)
+        else:
+            if st.sidebar.button('Detect Objects'):
+                # res = model.predict(source_video,
+                #                     conf=confidence
+                #                     )
+                # detected_frames = []
+                # cap = cv2.VideoCapture(source_video)
+                # while True:
+                #     ret, frame = cap.read()
+                #     if not ret:
+                #         break
+                #     # Perform object detection on the frame
+                #     # Assuming `model` is your object detection model
+                #     # You'll need to replace this with your actual object detection logic
+
+                #     res = model.predict(frame, conf=confidence)
+                #     boxes = res[0].boxes
+                #     # Plot the detection results on the frame
+                #     frame_with_boxes = res[0].plot()
+                #     detected_frames.append(frame_with_boxes)
+
+                # # Display the processed video with detection results
+                # for frame_with_boxes in detected_frames:
+                #     st.image(frame_with_boxes, caption='Detected Video Frame',
+                #              use_column_width=True)
+
+                # try:
+                #     with st.expander("Detection Results"):
+                #         for frame_boxes in boxes:
+                #             st.write(frame_boxes.data)
+                # except Exception as ex:
+                #     st.write("No video is uploaded yet!")
+                # st.write("Object detection for video is not implemented yet!")
+                try:
+                    vid_cap = cv2.VideoCapture(
+                        str(settings.VIDEOS_DICT.get(source_video)))
+                    st_frame = st.empty()
+                    while (vid_cap.isOpened()):
+                        success, image = vid_cap.read()
+                        if success:
+                            helper._display_detected_frames(confidence,
+                                                    model,
+                                                    st_frame,
+                                                    image,
+                                                    helper.is_display_tracker,
+                                                    helper.tracker
+                                                    )
+                        else:
+                            vid_cap.release()
+                            break
+                except Exception as e:
+                    st.sidebar.error("Error loading video: " + str(e))
+    # helper.play_stored_video(confidence, model)
 
 elif source_radio == settings.WEBCAM:
     helper.play_webcam(confidence, model)
