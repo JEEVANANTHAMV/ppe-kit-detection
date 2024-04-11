@@ -19,7 +19,8 @@ RTSP = 'RTSP'
 YOUTUBE = 'YouTube'
 
 SOURCES_LIST = [IMAGE, VIDEO, WEBCAM, RTSP, YOUTUBE]
-
+ASSET_DIR = ROOT / 'images'
+LOGO_PATH = ASSET_DIR / 'logo.png'
 # Images config
 IMAGES_DIR = ROOT / 'images'
 DEFAULT_IMAGE = IMAGES_DIR / 'office_4.jpg'
@@ -37,9 +38,6 @@ DEFAULT_DETECT_VIDEO = VIDEO_DIR / 'video_1.mp4'
 # ML Model config
 MODEL_DIR = ROOT / 'weights'
 DETECTION_MODEL = MODEL_DIR / 'best.pt'
-# In case of your custome model comment out the line above and
-# Place your custom model pt file name at the line below 
-# DETECTION_MODEL = MODEL_DIR / 'my_detection_model.pt'
 
 SEGMENTATION_MODEL = MODEL_DIR / 'yolov8n-seg.pt'
 

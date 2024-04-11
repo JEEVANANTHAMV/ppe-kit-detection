@@ -4,10 +4,12 @@ import PIL
 import cv2
 # External packages
 import streamlit as st
+import tempfile
 
 # Local Modules
 import settings
 import helper
+from streamlit_extras.app_logo import add_logo
 
 # Setting page layout
 st.set_page_config(
@@ -16,7 +18,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
+def logo():
+    add_logo(settings.LOGO_PATH, height=300)
 # Main page heading
 st.title("L&T PES Object Detection And Tracking using YOLOv8")
 
@@ -95,19 +98,18 @@ if source_radio == settings.IMAGE:
                     st.write("No image is uploaded yet!")
 
 elif source_radio == settings.VIDEO:
-    print("here")
     source_video = st.sidebar.file_uploader(
         "Choose a video...", type=("mp4", "avi", "mov", "wmv"))
 
     col1, col2 = st.columns(2)
-    print(col1, "col1")
+    print(col1, col2)
     with col1:
         try:
             if source_video is None:
                 default_video_path = str(settings.DEFAULT_VIDEO)
-                st.video(default_video_path)
+                st.video(default_video_path, format="video/mp4")
             else:
-                st.video(source_video)
+                st.video(source_video, format="video/mp4")
         except Exception as ex:
             st.error("Error occurred while opening the video.")
             st.error(ex)
@@ -115,58 +117,34 @@ elif source_radio == settings.VIDEO:
     with col2:
         if source_video is None:
             default_detected_video_path = str(settings.DEFAULT_DETECT_VIDEO)
-            st.video(default_detected_video_path)
+            st.video(default_detected_video_path, format="video/mp4")
         else:
+            is_display_tracker, tracker = helper.display_tracker_options();
             if st.sidebar.button('Detect Objects'):
-                # res = model.predict(source_video,
-                #                     conf=confidence
-                #                     )
-                # detected_frames = []
-                # cap = cv2.VideoCapture(source_video)
-                # while True:
-                #     ret, frame = cap.read()
-                #     if not ret:
-                #         break
-                #     # Perform object detection on the frame
-                #     # Assuming `model` is your object detection model
-                #     # You'll need to replace this with your actual object detection logic
-
-                #     res = model.predict(frame, conf=confidence)
-                #     boxes = res[0].boxes
-                #     # Plot the detection results on the frame
-                #     frame_with_boxes = res[0].plot()
-                #     detected_frames.append(frame_with_boxes)
-
-                # # Display the processed video with detection results
-                # for frame_with_boxes in detected_frames:
-                #     st.image(frame_with_boxes, caption='Detected Video Frame',
-                #              use_column_width=True)
-
-                # try:
-                #     with st.expander("Detection Results"):
-                #         for frame_boxes in boxes:
-                #             st.write(frame_boxes.data)
-                # except Exception as ex:
-                #     st.write("No video is uploaded yet!")
-                # st.write("Object detection for video is not implemented yet!")
+                temp_file = tempfile.NamedTemporaryFile(delete=False)
+                temp_file.write(source_video.read());
                 try:
                     vid_cap = cv2.VideoCapture(
-                        str(settings.VIDEOS_DICT.get(source_video)))
+                        str(temp_file.name))
+                    
                     st_frame = st.empty()
-                    while (vid_cap.isOpened()):
-                        success, image = vid_cap.read()
+                    while True:
+                        success, frame = vid_cap.read()
                         if success:
+                            # frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert to RGB
+                            # frame = cv2.resize(frame, (720, int(720*(9/16))))  # Resize if needed
                             helper._display_detected_frames(confidence,
                                                     model,
                                                     st_frame,
-                                                    image,
-                                                    helper.is_display_tracker,
-                                                    helper.tracker
+                                                    frame,
+                                                    is_display_tracker,
+                                                    tracker
                                                     )
                         else:
                             vid_cap.release()
                             break
                 except Exception as e:
+                    print("err", e)
                     st.sidebar.error("Error loading video: " + str(e))
     # helper.play_stored_video(confidence, model)
 
@@ -178,6 +156,3 @@ elif source_radio == settings.RTSP:
 
 elif source_radio == settings.YOUTUBE:
     helper.play_youtube_video(confidence, model)
-
-else:
-    st.error("Please select a valid source type!")
