@@ -35,9 +35,10 @@ VIDEOS_DICT = {
 }
 DEFAULT_VIDEO = VIDEO_DIR / 'video_1.mp4'
 DEFAULT_DETECT_VIDEO = VIDEO_DIR / 'video_1.mp4'
+DEFAULT_YOUTUBE = 'https://www.youtube.com/watch?v=UZ_RrLxMrEg'
 # ML Model config
 MODEL_DIR = ROOT / 'weights'
-DETECTION_MODEL = MODEL_DIR / 'best.pt'
+DETECTION_MODEL = MODEL_DIR / 'weights.onnx'
 
 SEGMENTATION_MODEL = MODEL_DIR / 'yolov8n-seg.pt'
 
