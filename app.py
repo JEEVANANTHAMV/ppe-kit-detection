@@ -9,7 +9,6 @@ import tempfile
 # Local Modules
 import settings
 import helper
-from streamlit_extras.app_logo import add_logo
 
 # Setting page layout
 st.set_page_config(
@@ -18,9 +17,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-def logo():
-    add_logo(settings.LOGO_PATH, height=300)
-# Main page heading
 st.title("L&T PES Object Detection And Tracking using YOLOv8")
 
 # Sidebar

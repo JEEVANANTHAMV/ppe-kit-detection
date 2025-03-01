@@ -17,7 +17,7 @@ def load_model(model_path):
     Returns:
         A YOLO object detection model.
     """
-    model = YOLO(model_path)
+    model = YOLO(model_path, task="detect")
     return model
 
 
