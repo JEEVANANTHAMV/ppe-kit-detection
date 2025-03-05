@@ -1,8 +1,0 @@
-Boots
-Ear-protection
-Glass
-Glove
-Helmet
-Mask
-Person
-Vest
