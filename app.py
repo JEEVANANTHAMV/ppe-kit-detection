@@ -88,26 +88,7 @@ We'll store metadata and processing status in memory for easy reference:
 """
 videos_info = {}
 video_id_counter = 1
-
-# -------------------------------------------------
-# HELPER FUNCTIONS
-# -------------------------------------------------
-# def identify_person(face_image):
-#     """Stub for face recognition."""
-#     global next_person_id
-#     try:
-#         encoding = face_recognition.face_encodings(face_image)[0]
-#     except IndexError:
-#         return None
-
-#     for person_id, known_encoding in known_faces.items():
-#         if face_recognition.compare_faces([known_encoding], encoding, tolerance=0.6)[0]:
-#             return person_id
-
-#     person_id = next_person_id
-#     known_faces[person_id] = encoding
-#     next_person_id += 1
-#     return person_id
+REQUIRED_ITEMS = {"No-Mask", "No-Safety-Vest", "No-Hardhat"}
 
 def detect_objects(image):
     """
@@ -122,14 +103,37 @@ def detect_objects(image):
     
     boxes = results.boxes
     class_confidences = {}
-    for box in boxes:
+    for i, box in enumerate(boxes):
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         class_name = results.names[cls_id]
         if class_name not in class_confidences:
             class_confidences[class_name] = []
         class_confidences[class_name].append(conf)
+        violators = []
+        if class_name == "Person":
+                person_id = f"Person_{i}"
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                
+                detected_items = set()
+                for j, sub_box in enumerate(boxes):
+                    sub_cls_id = int(sub_box.cls[0])
+                    sub_class_name = results.names[sub_cls_id]
+                    sx1, sy1, sx2, sy2 = map(int, sub_box.xyxy[0])
 
+                    if x1 <= sx1 <= x2 and y1 <= sy1 <= y2:
+                        detected_items.add(sub_class_name)
+
+                missing_items = REQUIRED_ITEMS - detected_items
+                if missing_items:
+                    # face_image = extract_face(image, box)
+                    # log_violation(person_id, face_image)
+                    violators.append((person_id, missing_items))
+
+                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(annotated_image, "Violation", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    print("Ravan ", violators)
     return boxes, results, annotated_image, colors, class_confidences
 
 def check_violations(class_confidences, threshold=0.5):
@@ -192,7 +196,7 @@ def save_annotated_plot(
 
     plt.tight_layout()
 
-    output_dir = os.getenv("OUTPUT_DIR", ".")
+    output_dir = os.getenv("OUTPUT_DIR", "./violation_images")
     os.makedirs(output_dir, exist_ok=True)
 
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
