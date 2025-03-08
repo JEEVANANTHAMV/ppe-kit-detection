@@ -1,307 +1,157 @@
 import os
 import cv2
 import time
+import json
 import asyncio
-import sqlite3
 import datetime
-import numpy as np
-# import face_recognition
-import redis.asyncio as aioredis
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from typing import List, Union
-from dotenv import load_dotenv
+from typing import List, Union, Optional
 
-load_dotenv()
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    Body,
+    HTTPException,
+    BackgroundTasks
+)
 
-from ultralytics import YOLO
+from helper import (
+    init_db,
+    check_camera_exists,
+    insert_video_record,
+    get_tenant_config,
+    list_face_records,
+    compare_embeddings,
+    detect_objects,
+    check_violations,
+    save_annotated_plot,
+    save_violation_to_db,
+    extract_face_embedding,
+    trigger_external_event,
+    # Face management
+    add_face_record,
+    update_face_record,
+    delete_face_record,
+    list_face_records,
+    # Tenant config
+    add_or_update_tenant_config,
+    delete_tenant_config
+)
 
-app = FastAPI()
-confidence_threshold = int(os.getenv("CONFIDENCE_THRESHOLD", 0.5))
-MODEL_PATH = "weights/best.pt"
-model = YOLO(MODEL_PATH)
-# model.to("cuda")  # run YOLO on GPU
+app = FastAPI(title="Safety Violation Detector")
+init_db()
 
+# Global in-memory structures
+videos_info = {}  # video_id -> metadata (for runtime tracking)
+violation_counters = {}  # (tenant_id, camera_id, face_id) -> int
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-VIOLATION_DIR = "violation_images"
-os.makedirs(VIOLATION_DIR, exist_ok=True)
-redis_client = aioredis.Redis(host="localhost", port=6379, decode_responses=True)
 
-known_faces = {}
-next_person_id = 1
-
-VIOLATION_THRESHOLDS = {
-    "NO-Hardhat": 10,
-    "NO-Mask": 20,
-    "NO-Safety Vest": 44
-}
-
-def init_db():
-    conn = sqlite3.connect("violations.db")
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS violations (
-            video_name TEXT,
-            violation_timestamp REAL,
-            person_number INTEGER,
-            violation_type TEXT,
-            violation_image_path TEXT
-        )"""
-    )
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def save_violation_to_db(video_name, violation_timestamp, person_number, violation_type, violation_image_path):
-    conn = sqlite3.connect("violations.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO violations VALUES (?, ?, ?, ?, ?)",
-        (video_name, violation_timestamp, person_number, violation_type, violation_image_path),
-    )
-    conn.commit()
-    conn.close()
-
-"""
-We'll store metadata and processing status in memory for easy reference:
-    videos_info = {
-       1: {
-           "video_name": "video1.mp4",
-           "filename": "uploads/video1.mp4",
-           "size": 12345678,   # in bytes
-           "fps": 30.0,
-           "total_frames": 900,  # approximate
-           "duration": 30.0,
-           "status": "uploaded"  # or "processing" or "done"
-           "frames_processed": 0,
-           "violations_detected": 0,
-           "persons_involved": 0,
-       },
-       2: {...},
-       ...
-    }
-"""
-videos_info = {}
-video_id_counter = 1
-REQUIRED_ITEMS = {"No-Mask", "No-Safety-Vest", "No-Hardhat"}
-
-def detect_objects(image):
-    """
-    YOLOv8 detection: returns boxes, results, annotated_image (RGB),
-    colors, and class_confidences dict
-    """
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = model(image_rgb, verbose=False)[0]
-    annotated_image = image_rgb.copy()
-    np.random.seed(42)
-    colors = np.random.randint(0, 255, size=(100, 3), dtype=np.uint8)
-    
-    boxes = results.boxes
-    class_confidences = {}
-    for i, box in enumerate(boxes):
-        cls_id = int(box.cls[0])
-        conf = float(box.conf[0])
-        class_name = results.names[cls_id]
-        if class_name not in class_confidences:
-            class_confidences[class_name] = []
-        class_confidences[class_name].append(conf)
-        violators = []
-        if class_name == "Person":
-                person_id = f"Person_{i}"
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-                detected_items = set()
-                for j, sub_box in enumerate(boxes):
-                    sub_cls_id = int(sub_box.cls[0])
-                    sub_class_name = results.names[sub_cls_id]
-                    sx1, sy1, sx2, sy2 = map(int, sub_box.xyxy[0])
-
-                    if x1 <= sx1 <= x2 and y1 <= sy1 <= y2:
-                        detected_items.add(sub_class_name)
-
-                missing_items = REQUIRED_ITEMS - detected_items
-                if missing_items:
-                    # face_image = extract_face(image, box)
-                    # log_violation(person_id, face_image)
-                    violators.append((person_id, missing_items))
-
-                    cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cv2.putText(annotated_image, "Violation", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    print("Ravan ", violators)
-    return boxes, results, annotated_image, colors, class_confidences
-
-def check_violations(class_confidences, threshold=0.5):
-    """
-    If any "NO-*" class has confidence > threshold, consider it a violation.
-    Returns list of classes that are in violation.
-    """
-    violations_found = []
-    for class_name, conf_list in class_confidences.items():
-        if class_name.startswith("NO-"):
-            if any(conf > threshold for conf in conf_list):
-                violations_found.append(class_name)
-    return violations_found
-
-def save_annotated_plot(
-    original_bgr_image,
-    boxes,
-    class_names,
-    annotated_image_rgb,
-    colors,
-    confidence_threshold,
-    video_source
-):
-    """
-    Saves the annotated results to a PNG file. Returns path.
-    """
-    original_image_rgb = cv2.cvtColor(original_bgr_image, cv2.COLOR_BGR2RGB)
-    class_labels = {}
-    for box in boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        confidence = float(box.conf[0])
-        if confidence > confidence_threshold:
-            class_id = int(box.cls[0])
-            class_name = class_names[class_id]
-            color = colors[class_id % len(colors)].tolist()
-            cv2.rectangle(annotated_image_rgb, (x1, y1), (x2, y2), color, 2)
-            class_labels[class_name] = color
-
-    plt.figure(figsize=(12, 6))
-    # Original
-    plt.subplot(1, 2, 1)
-    plt.title('Original Frame')
-    plt.imshow(original_image_rgb)
-    plt.axis('off')
-    # Annotated
-    plt.subplot(1, 2, 2)
-    plt.title('Detected Objects')
-    plt.imshow(annotated_image_rgb)
-    plt.axis('off')
-
-    legend_handles = []
-    for class_name, color in class_labels.items():
-        normalized_color = np.array(color) / 255.0
-        legend_handles.append(
-            plt.Line2D([0], [0], marker='o', color='w', label=class_name,
-                       markerfacecolor=normalized_color, markersize=10)
-        )
-    if legend_handles:
-        plt.legend(handles=legend_handles, loc='upper right', title='Classes')
-
-    plt.tight_layout()
-
-    output_dir = os.getenv("OUTPUT_DIR", "./violation_images")
-    os.makedirs(output_dir, exist_ok=True)
-
-    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_filename = f"detected_objects_{timestamp_str}.png"
-    output_path = os.path.join(output_dir, output_filename)
-
-    plt.savefig(output_path)
-    plt.close()
-
-    print(f"[INFO] Annotated result saved to: {output_path}")
-    return output_path
-
-async def process_video_stream(video_id: int):
-    """
-    Reads frames from the video, does YOLO detection at ~20 FPS,
-    logs violations, updates videos_info in real-time.
-    """
-    if video_id not in videos_info:
-        return
-
-    video_meta = videos_info[video_id]
-    video_path = video_meta["filename"]
-    cap = cv2.VideoCapture(video_path)
-
-    if not cap.isOpened():
-        print(f"[ERROR] Cannot open video source: {video_path}")
-        video_meta["status"] = "error"
-        return
-
-    video_meta["status"] = "processing"
-    
-    original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_skip_interval = max(1, int(original_fps // 20))
-
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_count += 1
-        if frame_count % frame_skip_interval != 0:
-            continue
-
-        boxes, results, annotated_img, colors, class_confidences = await asyncio.to_thread(detect_objects, frame)
-        violations_found = check_violations(class_confidences, threshold=0.5)
-        if violations_found:
-            annotated_path = save_annotated_plot(
-                original_bgr_image=frame,
-                boxes=boxes,
-                class_names=results.names,
-                annotated_image_rgb=annotated_img,
-                colors=colors,
-                confidence_threshold=0.5,
-                video_source=video_path
-            )
-
-            for vio in violations_found:
-                save_violation_to_db(
-                    video_name=video_meta["video_name"],
-                    violation_timestamp=time.time(),
-                    person_number=None,
-                    violation_type=vio,
-                    violation_image_path=annotated_path
-                )
-            video_meta["violations_detected"] += len(violations_found)
-        video_meta["frames_processed"] += frame_skip_interval
-
-        await asyncio.sleep(0)
-
-    cap.release()
-    video_meta["status"] = "done"
-    print(f"[INFO] Finished processing {video_meta['video_name']}.")
+######################################################################
+# 1) Video/Stream Registration Endpoint
+######################################################################
 
 @app.post("/videos")
-async def upload_videos(files: List[UploadFile] = File(...)):
+async def upload_video(
+    tenant_id: str = Form(...),
+    camera_id: str = Form(...),
+    is_live: bool = Form(False),
+    stream_url: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None)
+):
     """
-    1) POST /videos to upload multiple video files (up to 5).
-    If user sends more than 5, we only accept the first 5.
+    Register or upload a single video/stream for a given tenant & camera.
+      - If is_live=True, must provide stream_url (no file).
+      - If is_live=False, must provide a file (no stream_url).
+      - (tenant_id, camera_id) must be unique in the database.
     """
-    global video_id_counter
-    accepted_files = files[:5]  # only first 5
+    # 1) Check if (tenant_id, camera_id) already exists
+    if check_camera_exists(tenant_id, camera_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Camera '{camera_id}' already exists for tenant '{tenant_id}'."
+        )
 
-    if not accepted_files:
-        return {"message": "No files received."}
+    # 2) If live stream
+    if is_live:
+        if not stream_url or file is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="For a live feed (is_live=True), provide stream_url only (no file)."
+            )
+        video_id = insert_video_record(
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            is_live=True,
+            stream_url=stream_url
+        )
+        # We'll store minimal metadata for a live stream
+        videos_info[video_id] = {
+            "video_id": video_id,
+            "tenant_id": tenant_id,
+            "camera_id": camera_id,
+            "is_live": True,
+            "stream_url": stream_url,
+            "filename": None,
+            "size": 0,
+            "fps": 0,
+            "total_frames": 0,
+            "duration": 0,
+            "status": "registered",
+            "frames_processed": 0,
+            "violations_detected": 0
+        }
+        return {
+            "video_id": video_id,
+            "tenant_id": tenant_id,
+            "camera_id": camera_id,
+            "is_live": True,
+            "stream_url": stream_url,
+            "message": "Live stream registered successfully."
+        }
 
-    responses = []
-    for f in accepted_files:
-        file_location = os.path.join(UPLOAD_DIR, f.filename)
+    # 3) Otherwise, offline video
+    else:
+        if file is None or stream_url is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="For an offline video (is_live=False), provide a file only (no stream_url)."
+            )
+        file_location = os.path.join(UPLOAD_DIR, file.filename)
         with open(file_location, "wb") as buffer:
-            buffer.write(await f.read())
+            buffer.write(await file.read())
 
+        # Extract metadata with OpenCV
         cap = cv2.VideoCapture(file_location)
         if not cap.isOpened():
-            responses.append({"filename": f.filename, "error": "Cannot read video."})
-            continue
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot open or read video file: {file.filename}"
+            )
         size_bytes = os.path.getsize(file_location)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
         cap.release()
 
-        v_id = video_id_counter
-        videos_info[v_id] = {
-            "video_name": f.filename,
+        video_id = insert_video_record(
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            is_live=False,
+            filename=file_location,
+            size=size_bytes,
+            fps=fps,
+            total_frames=total_frames,
+            duration=duration
+        )
+        videos_info[video_id] = {
+            "video_id": video_id,
+            "tenant_id": tenant_id,
+            "camera_id": camera_id,
+            "is_live": False,
+            "stream_url": None,
             "filename": file_location,
             "size": size_bytes,
             "fps": fps,
@@ -309,77 +159,63 @@ async def upload_videos(files: List[UploadFile] = File(...)):
             "duration": duration,
             "status": "uploaded",
             "frames_processed": 0,
-            "violations_detected": 0,
-            "persons_involved": 0
+            "violations_detected": 0
         }
-        video_id_counter += 1
+        return {
+            "video_id": video_id,
+            "tenant_id": tenant_id,
+            "camera_id": camera_id,
+            "is_live": False,
+            "filename": file.filename,
+            "size": size_bytes,
+            "fps": fps,
+            "duration": duration,
+            "message": "Video uploaded successfully."
+        }
 
-        responses.append({"video_id": v_id, "filename": f.filename, "size": size_bytes,
-                          "fps": fps, "duration": duration})
 
-    return {"accepted_videos": responses}
-
+######################################################################
+# 2) Listing & Status Endpoints
+######################################################################
 
 @app.get("/videos")
 def list_videos():
     """
-    2) GET /videos to list all videos with info: size, fps, duration, status, etc.
+    Lists all videos/streams currently known in-memory.
+    (In production, you might want to query the DB instead.)
     """
-    all_vids = []
+    result = []
     for vid_id, meta in videos_info.items():
-        all_vids.append({
+        result.append({
             "video_id": vid_id,
-            "video_name": meta["video_name"],
+            "tenant_id": meta["tenant_id"],
+            "camera_id": meta["camera_id"],
+            "is_live": meta["is_live"],
+            "filename": meta["filename"],
+            "stream_url": meta["stream_url"],
+            "status": meta["status"],
             "size": meta["size"],
             "fps": meta["fps"],
             "total_frames": meta["total_frames"],
-            "duration": meta["duration"],
-            "status": meta["status"]
+            "duration": meta["duration"]
         })
-    return {"videos": all_vids}
-
-
-@app.post("/process")
-async def process_videos(video_ids: Union[List[int], str] = Body(...)):
-    """
-    3) POST /process
-       - if body is "[*]", process all videos in parallel (limit to those with status 'uploaded' or 'done' but re-run if you want).
-       - if body is a list of IDs [1,2], process those specifically.
-    """
-    if isinstance(video_ids, str) and video_ids.strip() == "*":
-        vids_to_run = list(videos_info.keys())
-    elif isinstance(video_ids, list):
-        vids_to_run = video_ids
-    else:
-        raise HTTPException(status_code=400, detail="Invalid input. Must be '*' or list of IDs.")
-
-    tasks = []
-    for vid in vids_to_run:
-        if vid not in videos_info:
-            continue
-        tasks.append(asyncio.create_task(process_video_stream(vid)))
-
-    if not tasks:
-        return {"message": "No valid videos to process."}
-
-    return {"message": f"Triggered processing for videos: {vids_to_run}"}
+    return {"videos": result}
 
 
 @app.get("/status")
 def get_status():
     """
-    4) GET /status
-    Return real-time status: frames processed, # violations, # persons involved
+    Returns real-time status for each video/stream.
     """
     status_list = []
     for vid_id, meta in videos_info.items():
         status_list.append({
             "video_id": vid_id,
-            "video_name": meta["video_name"],
+            "tenant_id": meta["tenant_id"],
+            "camera_id": meta["camera_id"],
             "status": meta["status"],
             "frames_processed": meta["frames_processed"],
-            "violations_detected": meta["violations_detected"],
-            "persons_involved": meta["persons_involved"]
+            "violations_detected": meta["violations_detected"]
         })
     return {"videos_status": status_list}
 
@@ -387,42 +223,323 @@ def get_status():
 @app.get("/stats")
 def get_stats():
     """
-    5) GET /stats
-    - total video duration
-    - total processed duration
-    - number of persons involved in violations
-    - highest violation count for each video
+    Returns aggregated stats across all videos/streams:
+      - total_video_duration
+      - total_processed_duration
+      - violation_counts_per_video
     """
     total_duration = sum(v["duration"] for v in videos_info.values())
-    total_processed_frames = sum(v["frames_processed"] for v in videos_info.values())
-   
     total_processed_duration = 0
-    for meta in videos_info.values():
-        fps = meta["fps"] if meta["fps"] > 0 else 30
-        processed_dur = (meta["frames_processed"] / fps)
-        total_processed_duration += processed_dur
-
-    total_persons_involved = sum(v["persons_involved"] for v in videos_info.values())
-
     violation_counts = {}
     for vid_id, meta in videos_info.items():
+        fps = meta["fps"] if meta["fps"] > 0 else 30
+        processed_dur = meta["frames_processed"] / fps
+        total_processed_duration += processed_dur
         violation_counts[vid_id] = meta["violations_detected"]
-
     return {
         "total_video_duration": total_duration,
         "total_processed_duration": total_processed_duration,
-        "total_persons_involved_in_violation": total_persons_involved,
         "violation_counts_per_video": violation_counts
     }
 
 
-# --------------------------------------------------
-# HOW TO RUN:
-# uvicorn this_script:app --reload
-# Then test endpoints:
-# 1) POST /videos (multipart form-data: files=)
-# 2) GET /videos
-# 3) POST /process with body = "*" or [1,2]
-# 4) GET /status
-# 5) GET /stats
-# --------------------------------------------------
+######################################################################
+# 3) Processing Videos/Streams
+######################################################################
+
+async def process_video_stream(video_id: int):
+    """
+    Background task to process a single video or live stream:
+      1) Grab frames from the source (file or stream).
+      2) YOLO detection to find persons missing safety items.
+      3) Attempt to extract face embeddings (DeepFace).
+      4) If face recognized, increment violation counters.
+      5) If counter >= threshold, log to DB + optional external event.
+    """
+    if video_id not in videos_info:
+        return
+
+    meta = videos_info[video_id]
+    tenant_id = meta["tenant_id"]
+    camera_id = meta["camera_id"]
+    config = get_tenant_config(tenant_id)
+    if not config:
+        print(f"[ERROR] No tenant configuration found for tenant {tenant_id}. Aborting.")
+        meta["status"] = "error"
+        return
+    similarity_threshold = config["similarity_threshold"]
+    violation_threshold = config["violation_threshold"]
+    external_trigger_url = config["external_trigger_url"]
+
+    # Open source
+    cap = cv2.VideoCapture(meta["stream_url"] if meta["is_live"] else meta["filename"])
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open source for video_id {video_id}")
+        meta["status"] = "error"
+        return
+
+    meta["status"] = "processing"
+    original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    frame_skip_interval = max(1, int(original_fps // 20))
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+
+        # Skip frames to aim ~20 FPS
+        if frame_count % frame_skip_interval != 0:
+            continue
+
+        # 1) Detect objects + persons with missing items
+        boxes, results, annotated_img, colors, class_confidences, violation_faces = await asyncio.to_thread(
+            detect_objects, frame
+        )
+        # 2) Check for "NO-" classes
+        violations_found = check_violations(class_confidences, threshold=0.5)
+        if violations_found:
+            # 2a) Save annotated frame
+            annotated_path = save_annotated_plot(
+                original_bgr_image=frame,
+                boxes=boxes,
+                class_names=results.names,
+                annotated_image_rgb=annotated_img,
+                colors=colors,
+                confidence_threshold=0.5,
+                video_source=meta["stream_url"] if meta["is_live"] else meta["filename"]
+            )
+            # 2b) For each violating person, try face recognition
+            for person_id, (x1, y1, x2, y2) in violation_faces:
+                # Attempt face extraction
+                embedding = extract_face_embedding(frame, (x1, y1, x2, y2))
+                if embedding is None:
+                    # Face not visible or can't be extracted
+                    continue
+
+                # Try matching with known faces for this tenant
+                matched_face_id = None
+                all_faces = list_face_records(tenant_id)
+                for face_rec in all_faces:
+                    # We only consider faces that are relevant to the same camera
+                    if face_rec["camera_id"] != camera_id:
+                        continue
+                    known_embedding = face_rec["embedding"]
+                    if compare_embeddings(embedding, known_embedding, similarity_threshold):
+                        matched_face_id = face_rec["face_id"]
+                        break
+
+                if not matched_face_id:
+                    # Face recognized for no known user => skip
+                    continue
+
+                # 2c) Increment violation counter
+                key = (tenant_id, camera_id, matched_face_id)
+                violation_counters[key] = violation_counters.get(key, 0) + 1
+
+                # 2d) If threshold is reached, escalate
+                if violation_counters[key] >= violation_threshold:
+                    # Save to DB
+                    save_violation_to_db(
+                        tenant_id=tenant_id,
+                        camera_id=camera_id,
+                        violation_timestamp=time.time(),
+                        face_id=matched_face_id,
+                        violation_type="Repeated Violation",
+                        violation_image_path=annotated_path,
+                        details=json.dumps({"person_id": person_id, "count": violation_counters[key]})
+                    )
+                    # Reset counter
+                    violation_counters[key] = 0
+                    # Increment local count
+                    meta["violations_detected"] += 1
+                    # Optional external event
+                    if external_trigger_url:
+                        payload = {
+                            "tenant_id": tenant_id,
+                            "camera_id": camera_id,
+                            "face_id": matched_face_id,
+                            "violation_count": violation_threshold,
+                            "timestamp": time.time()
+                        }
+                        asyncio.create_task(trigger_external_event(external_trigger_url, payload))
+
+        meta["frames_processed"] += frame_skip_interval
+        await asyncio.sleep(0)
+
+    cap.release()
+    meta["status"] = "done"
+    print(f"[INFO] Finished processing video_id={video_id} (tenant={tenant_id}, camera={camera_id}).")
+
+
+@app.post("/process")
+async def process_videos(
+    video_ids: Union[List[int], str] = Body(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Triggers processing of the specified videos/streams.
+    Provide a list of video IDs or "*" to process all.
+    """
+    if isinstance(video_ids, str) and video_ids.strip() == "*":
+        vids_to_run = list(videos_info.keys())
+    elif isinstance(video_ids, list):
+        vids_to_run = video_ids
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid input. Must be '*' or list of video IDs."
+        )
+
+    if not vids_to_run:
+        return {"message": "No videos to process."}
+
+    triggered = []
+    for vid_id in vids_to_run:
+        if vid_id in videos_info:
+            # Queue the background task
+            background_tasks.add_task(process_video_stream, vid_id)
+            triggered.append(vid_id)
+
+    return {"message": f"Triggered processing for videos: {triggered}"}
+
+
+######################################################################
+# 4) Tenant Configuration Endpoints
+######################################################################
+
+@app.get("/tenants/{tenant_id}/config")
+def get_config(tenant_id: str):
+    config = get_tenant_config(tenant_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Configuration not found.")
+    return config
+
+
+@app.post("/tenants/{tenant_id}/config")
+def create_config(tenant_id: str, body: dict = Body(...)):
+    similarity_threshold = body.get("similarity_threshold")
+    violation_threshold = body.get("violation_threshold")
+    external_trigger_url = body.get("external_trigger_url", "")
+    if similarity_threshold is None or violation_threshold is None:
+        raise HTTPException(status_code=400, detail="Missing threshold values.")
+    add_or_update_tenant_config(tenant_id, similarity_threshold, violation_threshold, external_trigger_url)
+    return {"message": "Configuration created/updated."}
+
+
+@app.put("/tenants/{tenant_id}/config")
+def update_config(tenant_id: str, body: dict = Body(...)):
+    similarity_threshold = body.get("similarity_threshold")
+    violation_threshold = body.get("violation_threshold")
+    external_trigger_url = body.get("external_trigger_url", "")
+    if similarity_threshold is None or violation_threshold is None:
+        raise HTTPException(status_code=400, detail="Missing threshold values.")
+    add_or_update_tenant_config(tenant_id, similarity_threshold, violation_threshold, external_trigger_url)
+    return {"message": "Configuration updated."}
+
+
+@app.delete("/tenants/{tenant_id}/config")
+def remove_config(tenant_id: str):
+    delete_tenant_config(tenant_id)
+    return {"message": "Configuration deleted."}
+
+
+######################################################################
+# 5) Face Management Endpoints
+######################################################################
+
+@app.post("/tenants/{tenant_id}/faces")
+async def add_face(
+    tenant_id: str,
+    camera_id: str = Body(...),
+    name: str = Body(...),
+    file: UploadFile = File(...),
+    metadata: dict = Body({})
+):
+    """
+    Adds a new face record for a tenant & camera.
+    The uploaded image is used to extract a face embedding.
+    """
+    temp_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(temp_path, "wb") as f:
+        f.write(await file.read())
+
+    image = cv2.imread(temp_path)
+    if image is None:
+        os.remove(temp_path)
+        raise HTTPException(status_code=400, detail="Invalid image.")
+
+    embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
+    os.remove(temp_path)
+    if embedding is None:
+        raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
+
+    face_id = add_face_record(tenant_id, camera_id, name, embedding, metadata)
+    return {"message": "Face added", "face_id": face_id}
+
+
+@app.get("/tenants/{tenant_id}/faces")
+def list_faces_endpoint(tenant_id: str):
+    faces = list_face_records(tenant_id)
+    return {"faces": faces}
+
+
+@app.put("/tenants/{tenant_id}/faces/{face_id}")
+async def update_face_endpoint(
+    tenant_id: str,
+    face_id: int,
+    camera_id: str = Body(...),
+    name: str = Body(...),
+    file: UploadFile = File(...),
+    metadata: dict = Body({})
+):
+    """
+    Updates an existing face record.
+    """
+    temp_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(temp_path, "wb") as f:
+        f.write(await file.read())
+
+    image = cv2.imread(temp_path)
+    if image is None:
+        os.remove(temp_path)
+        raise HTTPException(status_code=400, detail="Invalid image.")
+
+    embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
+    os.remove(temp_path)
+    if embedding is None:
+        raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
+
+    update_face_record(face_id, tenant_id, camera_id, name, embedding, metadata)
+    return {"message": "Face updated successfully."}
+
+
+@app.delete("/tenants/{tenant_id}/faces/{face_id}")
+def remove_face(tenant_id: str, face_id: int):
+    delete_face_record(face_id, tenant_id)
+    return {"message": "Face deleted."}
+
+
+######################################################################
+# 6) External Trigger Testing
+######################################################################
+
+@app.post("/trigger-event")
+async def trigger_event(payload: dict = Body(...)):
+    """
+    Manually trigger an external event by providing a payload with:
+      - tenant_id
+      - camera_id
+      - event_url
+    """
+    tenant_id = payload.get("tenant_id")
+    camera_id = payload.get("camera_id")
+    event_url = payload.get("event_url")
+    if not tenant_id or not camera_id or not event_url:
+        raise HTTPException(
+            status_code=400,
+            detail="tenant_id, camera_id, and event_url are required."
+        )
+    status_code, response_text = await trigger_external_event(event_url, payload)
+    return {"status_code": status_code, "response_text": response_text}
