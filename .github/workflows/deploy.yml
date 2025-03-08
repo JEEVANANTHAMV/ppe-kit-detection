@@ -17,27 +17,36 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. Build Docker Image
+      # 2. Log in to Azure using the service principal JSON
+      # (the JSON from `az ad sp create-for-rbac --sdk-auth`)
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3. Build Docker Image
       - name: Build Docker Image
         run: |
           docker build -t ppe-kit:latest .
 
-      # 3. Tag Docker Image for ACR
+      # 4. Tag Docker Image for ACR
       - name: Tag Docker Image
         run: |
           docker tag ppe-kit:latest ${{ secrets.ACR_LOGIN_SERVER }}/ppe-kit:latest
 
-      # 4. Log in to Azure Container Registry (ACR)
+      # 5. Log in to Azure Container Registry
       - name: Login to Azure Container Registry
         run: |
-          docker login ${{ secrets.ACR_LOGIN_SERVER }} -u ${{ secrets.ACR_USERNAME }} -p ${{ secrets.ACR_PASSWORD }}
+          docker login ${{ secrets.ACR_LOGIN_SERVER }} \
+            -u ${{ secrets.ACR_USERNAME }} \
+            -p ${{ secrets.ACR_PASSWORD }}
 
-      # 5. Push Docker Image to ACR
+      # 6. Push Docker Image to ACR
       - name: Push Docker Image to ACR
         run: |
           docker push ${{ secrets.ACR_LOGIN_SERVER }}/ppe-kit:latest
 
-      # 6. Deploy Image to Azure Container Instances (ACI)
+      # 7. Deploy the container image to Azure Container Instances (ACI)
       - name: Deploy to ACI
         run: |
           az container create \
@@ -46,11 +55,12 @@ jobs:
             --image ${{ secrets.ACR_LOGIN_SERVER }}/ppe-kit:latest \
             --dns-name-label ppe-kit-demo \
             --ports 80 \
+            --os-type Linux \
             --registry-login-server ${{ secrets.ACR_LOGIN_SERVER }} \
             --registry-username ${{ secrets.ACR_USERNAME }} \
             --registry-password ${{ secrets.ACR_PASSWORD }}
 
-      # 7. Show Deployment Status
+      # 8. Show ACI Deployment Status
       - name: Show ACI Deployment Status
         run: |
           az container show \
