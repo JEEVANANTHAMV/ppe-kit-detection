@@ -54,7 +54,7 @@ jobs:
             --name ppe-kit-container \
             --image ${{ secrets.ACR_LOGIN_SERVER }}/ppe-kit:latest \
             --dns-name-label ppe-kit-demo \
-            --ports 80 \
+            --ports 8080 \
             --os-type Linux \
             --registry-login-server ${{ secrets.ACR_LOGIN_SERVER }} \
             --registry-username ${{ secrets.ACR_USERNAME }} \

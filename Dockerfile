@@ -1,5 +1,5 @@
 # Use a lightweight official Python image
-FROM python:3.11-slim
+FROM python:3.8-slim
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -26,7 +26,7 @@ RUN pip install --upgrade pip && \
 ENV PYTHONUNBUFFERED=1
 
 # Expose the port (Ensure it matches ACI deployment)
-EXPOSE 80
+EXPOSE 8080
 
 # Run the application (customize as needed)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

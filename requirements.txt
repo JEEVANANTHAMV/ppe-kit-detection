@@ -4,5 +4,8 @@ numpy==1.23.5
 opencv-python==4.11.0.86
 matplotlib==3.7.5
 deepface==0.0.93
+tensorflow==2.10.0
 ultralytics==8.3.85
 uvicorn==0.33.0
+tf-keras
+python-multipart
