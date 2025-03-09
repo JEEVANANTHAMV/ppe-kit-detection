@@ -16,7 +16,7 @@ from fastapi import (
     HTTPException,
     BackgroundTasks
 )
-
+import logging
 from helper import (
     init_db,
     check_camera_exists,
@@ -41,6 +41,10 @@ from helper import (
 
 app = FastAPI(title="Safety Violation Detector")
 init_db()
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Include timestamp in log message
+    level=logging.INFO  # Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+)
 
 # Global in-memory structures for runtime tracking
 videos_info = {}  # video_id -> metadata dict
@@ -399,6 +403,7 @@ def create_config(tenant_id: str, body: dict = Body(...)):
     violation_thresholds = body.get("violation_thresholds")
     external_trigger_url = body.get("external_trigger_url", "")
     if similarity_threshold is None or violation_thresholds is None:
+        logging.error(f"check the {similarity_threshold} or {violation_thresholds}")
         raise HTTPException(status_code=400, detail="Missing threshold values.")
     add_or_update_tenant_config(tenant_id, similarity_threshold, violation_thresholds, external_trigger_url)
     return {"message": "Configuration created/updated."}
@@ -428,8 +433,13 @@ async def add_face(
     camera_id: str = Form(...),
     name: str = Form(...),
     file: UploadFile = File(...),
-    metadata: dict = Body({})
+    metadata: str = Form(...),
 ):
+    try:
+        metadata_dict = json.loads(metadata)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid metadata JSON.")
+
     temp_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(temp_path, "wb") as f:
         f.write(await file.read())
@@ -439,9 +449,10 @@ async def add_face(
         raise HTTPException(status_code=400, detail="Invalid image.")
     embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
     os.remove(temp_path)
+
     if embedding is None:
         raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
-    face_id = add_face_record(tenant_id, camera_id, name, embedding, metadata)
+    face_id = add_face_record(tenant_id, camera_id, name, embedding, metadata_dict)
     return {"message": "Face added", "face_id": face_id}
 
 @app.get("/tenants/{tenant_id}/faces")
