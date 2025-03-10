@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import httpx
 from deepface import DeepFace
 from ultralytics import YOLO
+import logging
 
 # Try to import psycopg2 for Postgres support
 try:
@@ -16,14 +17,14 @@ try:
 except ImportError:
     psycopg2 = None
 
-# Database fallback path for SQLite (if external DB not provided)
+# Database fallback path for SQLite
 DB_PATH = os.getenv("SQLITE_DB_PATH", "violations.db")
 
 # ----------------- Database Connection Helpers ----------------- #
 def get_connection():
     """
-    Returns a tuple (conn, db_type). If DATABASE_URL is set and psycopg2 is available,
-    connects to Postgres; otherwise, connects to local SQLite.
+    Returns a tuple (conn, db_type). Uses Postgres if DATABASE_URL is set and psycopg2 is available;
+    otherwise connects to local SQLite.
     """
     database_url = os.getenv("DATABASE_URL")
     if database_url and psycopg2 is not None:
@@ -31,7 +32,7 @@ def get_connection():
             conn = psycopg2.connect(database_url)
             return conn, "postgres"
         except Exception as e:
-            print("Error connecting to Postgres:", e)
+            logging.error("Error connecting to Postgres: %s", e)
     import sqlite3
     conn = sqlite3.connect(DB_PATH)
     return conn, "sqlite"
@@ -47,7 +48,6 @@ def format_query(query, db_type):
 # ----------------- YOLO Initialization ----------------- #
 MODEL_PATH = "weights/best.pt"
 model = YOLO(MODEL_PATH)
-# Optionally, if CUDA is available, move model to GPU:
 try:
     import torch
     if torch.cuda.is_available():
@@ -62,13 +62,14 @@ REQUIRED_ITEMS = {"No-Mask", "No-Safety-Vest", "No-Hardhat"}
 def init_db():
     conn, db_type = get_connection()
     c = conn.cursor()
-    # Tenant configuration table: stores similarity_threshold (REAL),
-    # violation_thresholds (JSON as TEXT) and external_trigger_url (TEXT)
+    # Create tenant_config table with separate columns for each violation threshold
     query = """
     CREATE TABLE IF NOT EXISTS tenant_config (
         tenant_id TEXT PRIMARY KEY,
         similarity_threshold REAL,
-        violation_thresholds TEXT,
+        no_mask_threshold INTEGER,
+        no_safety_vest_threshold INTEGER,
+        no_hardhat_threshold INTEGER,
         external_trigger_url TEXT
     )
     """
@@ -165,32 +166,113 @@ def insert_video_record(
     conn.close()
     return video_id
 
+def list_video_records():
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration FROM videos"
+    c.execute(format_query(query, db_type))
+    rows = c.fetchall()
+    conn.close()
+    videos = []
+    for row in rows:
+        videos.append({
+            "video_id": row[0],
+            "tenant_id": row[1],
+            "camera_id": row[2],
+            "is_live": bool(row[3]),
+            "filename": row[4],
+            "stream_url": row[5],
+            "status": row[6],
+            "size": row[7],
+            "fps": row[8],
+            "total_frames": row[9],
+            "duration": row[10]
+        })
+    return videos
+
+def get_video_record(video_id: int):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration FROM videos WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (video_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "video_id": row[0],
+            "tenant_id": row[1],
+            "camera_id": row[2],
+            "is_live": bool(row[3]),
+            "filename": row[4],
+            "stream_url": row[5],
+            "status": row[6],
+            "size": row[7],
+            "fps": row[8],
+            "total_frames": row[9],
+            "duration": row[10]
+        }
+    return None
+
+def update_video_record(video_id: int, fields: dict) -> bool:
+    if not fields:
+        return False
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    set_clause = ", ".join([f"{k} = ?" for k in fields.keys()])
+    values = list(fields.values())
+    values.append(video_id)
+    query = f"UPDATE videos SET {set_clause} WHERE video_id = ?"
+    c.execute(format_query(query, db_type), tuple(values))
+    conn.commit()
+    conn.close()
+    return True
+
+def delete_video_record(video_id: int) -> bool:
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT filename FROM videos WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (video_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    filename = row[0]
+    query = "DELETE FROM videos WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (video_id,))
+    conn.commit()
+    conn.close()
+    if filename and os.path.exists(filename):
+        os.remove(filename)
+    return True
+
 # ----------------- Tenant Config Operations ----------------- #
 def get_tenant_config(tenant_id: str):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT similarity_threshold, violation_thresholds, external_trigger_url FROM tenant_config WHERE tenant_id = ?"
+    query = "SELECT similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url FROM tenant_config WHERE tenant_id = ?"
     c.execute(format_query(query, db_type), (tenant_id,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
             "similarity_threshold": row[0],
-            "violation_thresholds": json.loads(row[1]),
-            "external_trigger_url": row[2]
+            "no_mask_threshold": row[1],
+            "no_safety_vest_threshold": row[2],
+            "no_hardhat_threshold": row[3],
+            "external_trigger_url": row[4]
         }
     return None
 
-def add_or_update_tenant_config(tenant_id, similarity_threshold, violation_thresholds, external_trigger_url):
+def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url):
     existing = get_tenant_config(tenant_id)
     conn, db_type = get_connection()
     c = conn.cursor()
     if existing:
-        query = "UPDATE tenant_config SET similarity_threshold = ?, violation_thresholds = ?, external_trigger_url = ? WHERE tenant_id = ?"
-        c.execute(format_query(query, db_type), (similarity_threshold, json.dumps(violation_thresholds), external_trigger_url, tenant_id))
+        query = "UPDATE tenant_config SET similarity_threshold = ?, no_mask_threshold = ?, no_safety_vest_threshold = ?, no_hardhat_threshold = ?, external_trigger_url = ? WHERE tenant_id = ?"
+        c.execute(format_query(query, db_type), (similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, tenant_id))
     else:
-        query = "INSERT INTO tenant_config (tenant_id, similarity_threshold, violation_thresholds, external_trigger_url) VALUES (?, ?, ?, ?)"
-        c.execute(format_query(query, db_type), (tenant_id, similarity_threshold, json.dumps(violation_thresholds), external_trigger_url))
+        query = "INSERT INTO tenant_config (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url) VALUES (?, ?, ?, ?, ?, ?)"
+        c.execute(format_query(query, db_type), (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url))
     conn.commit()
     conn.close()
 
@@ -355,7 +437,7 @@ def save_annotated_plot(original_bgr_image, boxes, class_names, annotated_image_
     output_path = os.path.join(output_dir, output_filename)
     plt.savefig(output_path)
     plt.close()
-    print(f"[INFO] Annotated result saved to: {output_path}")
+    logging.info(f"[INFO] Annotated result saved to: {output_path}")
     return output_path
 
 def extract_face_embedding(image, face_box):
@@ -366,7 +448,7 @@ def extract_face_embedding(image, face_box):
         if isinstance(embeddings, list) and len(embeddings) > 0:
             return embeddings[0]["embedding"]
     except Exception as e:
-        print("extract_face_embedding error:", e)
+        logging.error("extract_face_embedding error: %s", e)
     return None
 
 def calculate_cosine_distance(emb1, emb2):
@@ -391,5 +473,5 @@ async def trigger_external_event(event_url, payload):
             response = await client.post(event_url, json=payload, timeout=10)
             return response.status_code, response.text
         except Exception as e:
-            print(f"Error triggering external event: {e}")
+            logging.error("Error triggering external event: %s", e)
             return None, str(e)
