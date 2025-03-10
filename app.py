@@ -38,6 +38,8 @@ from helper import (
     delete_tenant_config,
     DB_PATH  # for db-status endpoint
 )
+from pydantic import BaseModel, HttpUrl
+from typing import Dict, Optional
 
 app = FastAPI(title="Safety Violation Detector")
 init_db()
@@ -45,6 +47,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',  # Include timestamp in log message
     level=logging.INFO  # Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 )
+
+class TenantConfig(BaseModel):
+    similarity_threshold: float
+    violation_thresholds: Dict[str, int]
+    external_trigger_url: Optional[HttpUrl] = None
 
 # Global in-memory structures for runtime tracking
 videos_info = {}  # video_id -> metadata dict
@@ -395,27 +402,23 @@ def get_config(tenant_id: str):
     return config
 
 @app.post("/tenants/{tenant_id}/config")
-def create_config(tenant_id: str, body: dict = Body(...)):
-    # Expecting: similarity_threshold (float),
-    # violation_thresholds (dict mapping violation types to minutes),
-    # external_trigger_url (optional string)
-    similarity_threshold = body.get("similarity_threshold")
-    violation_thresholds = body.get("violation_thresholds")
-    external_trigger_url = body.get("external_trigger_url", "")
-    if similarity_threshold is None or violation_thresholds is None:
-        logging.error(f"check the {similarity_threshold} or {violation_thresholds}")
-        raise HTTPException(status_code=400, detail="Missing threshold values.")
-    add_or_update_tenant_config(tenant_id, similarity_threshold, violation_thresholds, external_trigger_url)
+def create_config(tenant_id: str, config: TenantConfig):
+    add_or_update_tenant_config(
+        tenant_id,
+        config.similarity_threshold,
+        config.violation_thresholds,
+        config.external_trigger_url
+    )
     return {"message": "Configuration created/updated."}
 
 @app.put("/tenants/{tenant_id}/config")
-def update_config(tenant_id: str, body: dict = Body(...)):
-    similarity_threshold = body.get("similarity_threshold")
-    violation_thresholds = body.get("violation_thresholds")
-    external_trigger_url = body.get("external_trigger_url", "")
-    if similarity_threshold is None or violation_thresholds is None:
-        raise HTTPException(status_code=400, detail="Missing threshold values.")
-    add_or_update_tenant_config(tenant_id, similarity_threshold, violation_thresholds, external_trigger_url)
+def update_config(tenant_id: str, config: TenantConfig):
+    add_or_update_tenant_config(
+        tenant_id,
+        config.similarity_threshold,
+        config.violation_thresholds,
+        config.external_trigger_url
+    )
     return {"message": "Configuration updated."}
 
 @app.delete("/tenants/{tenant_id}/config")
