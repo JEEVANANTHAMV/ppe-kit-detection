@@ -72,13 +72,13 @@ class TenantConfig(BaseModel):
 # Helper function to get the threshold (in minutes) for a given violation
 ######################################################################
 def get_threshold_for_violation(config: dict, vio: str) -> int:
-    if vio == "No-Mask":
-        return config.get("no_mask_threshold", 9999)
-    elif vio == "No-Safety-Vest":
-        return config.get("no_safety_vest_threshold", 9999)
-    elif vio == "No-Hardhat":
-        return config.get("no_hardhat_threshold", 9999)
-    return 9999
+    if vio == "NO-Mask":
+        return config.get("no_mask_threshold", 999)
+    elif vio == "NO-Safety Vest":
+        return config.get("no_safety_vest_threshold", 999)
+    elif vio == "NO-Hardhat":
+        return config.get("no_hardhat_threshold", 999)
+    return 999
 
 ######################################################################
 # 1) Video/Stream Registration Endpoint
@@ -330,41 +330,42 @@ async def process_video_stream(video_id: int):
                         violation_timers.pop(key, None)
                     continue
 
-                matched_face_id = None
+                matched_face_id = []
                 all_faces = list_face_records(tenant_id)
                 for face_rec in all_faces:
                     if face_rec["camera_id"] != camera_id:
                         continue
                     if compare_embeddings(embedding, face_rec["embedding"], similarity_threshold):
-                        matched_face_id = face_rec["face_id"]
-                        break
+                        matched_face_id.append(face_rec["face_id"])
+                        # break
                 if not matched_face_id:
                     continue
 
                 for vio in violations_found:
-                    key = (tenant_id, camera_id, matched_face_id, vio)
-                    threshold_minutes = get_threshold_for_violation(config, vio)
-                    threshold_seconds = threshold_minutes * 60
-                    if key not in violation_timers:
-                        violation_timers[key] = current_time
-                    else:
-                        elapsed = current_time - violation_timers[key]
-                        if elapsed >= threshold_seconds:
-                            violation_record = {
-                                "tenant_id": tenant_id,
-                                "camera_id": camera_id,
-                                "violation_timestamp": current_time,
-                                "face_id": matched_face_id,
-                                "violation_type": vio,
-                                "violation_image_path": annotated_path,
-                                "details": json.dumps({"person_id": person_id, "elapsed_seconds": elapsed})
-                            }
-                            save_violation_to_db(**violation_record)
+                    for face_id in matched_face_id:
+                        key = (tenant_id, camera_id, face_id, vio)
+                        threshold_minutes = get_threshold_for_violation(config, vio)
+                        threshold_seconds = threshold_minutes * 1
+                        if key not in violation_timers:
                             violation_timers[key] = current_time
-                            meta["violations_detected"] += 1
-                            if external_trigger_url:
-                                payload = violation_record.copy()
-                                asyncio.create_task(trigger_external_event(external_trigger_url, payload))
+                        else:
+                            elapsed = current_time - violation_timers[key]
+                            if elapsed >= threshold_seconds:
+                                violation_record = {
+                                    "tenant_id": tenant_id,
+                                    "camera_id": camera_id,
+                                    "violation_timestamp": current_time,
+                                    "face_id": face_id,
+                                    "violation_type": vio,
+                                    "violation_image_path": annotated_path,
+                                    "details": json.dumps({"person_id": person_id, "elapsed_seconds": elapsed})
+                                }
+                                save_violation_to_db(**violation_record)
+                                violation_timers[key] = current_time
+                                meta["violations_detected"] += 1
+                                if external_trigger_url:
+                                    payload = violation_record.copy()
+                                    asyncio.create_task(trigger_external_event(external_trigger_url, payload))
                 for key in list(violation_timers.keys()):
                     if key[0] == tenant_id and key[1] == camera_id and key[2] == matched_face_id and key[3] not in violations_found:
                         violation_timers.pop(key, None)
@@ -377,7 +378,7 @@ async def process_video_stream(video_id: int):
 
 @app.post("/process")
 async def process_videos(
-    video_ids: Union[List[int], str] = Body(...),
+    video_ids: Union[List[str], str] = Body(...),
     background_tasks: BackgroundTasks = None
 ):
     if isinstance(video_ids, str) and video_ids.strip() == "*":
@@ -406,6 +407,8 @@ def get_config(tenant_id: str):
     return config
 
 @app.post("/tenants/{tenant_id}/config")
+
+
 def create_config(tenant_id: str, config: TenantConfig):
     add_or_update_tenant_config(
         tenant_id,

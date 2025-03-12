@@ -10,6 +10,7 @@ import httpx
 from deepface import DeepFace
 from ultralytics import YOLO
 import logging
+import uuid
 
 # Try to import psycopg2 for Postgres support
 try:
@@ -19,6 +20,9 @@ except ImportError:
 
 # Database fallback path for SQLite
 DB_PATH = os.getenv("SQLITE_DB_PATH", "violations.db")
+
+def generate_uuid():
+    return str(uuid.uuid4())
 
 # ----------------- Database Connection Helpers ----------------- #
 def get_connection():
@@ -144,12 +148,14 @@ def insert_video_record(
 ) -> int:
     conn, db_type = get_connection()
     c = conn.cursor()
+    video_id = generate_uuid()
     query = """
-    INSERT INTO videos (tenant_id, camera_id, is_live, filename, stream_url, size, fps, total_frames, duration, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO videos (video_id, tenant_id, camera_id, is_live, filename, stream_url, size, fps, total_frames, duration, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     status = "registered" if is_live else "uploaded"
     c.execute(format_query(query, db_type), (
+        video_id,
         tenant_id,
         camera_id,
         1 if is_live else 0,
@@ -162,7 +168,6 @@ def insert_video_record(
         status
     ))
     conn.commit()
-    video_id = c.lastrowid
     conn.close()
     return video_id
 
@@ -254,6 +259,7 @@ def get_tenant_config(tenant_id: str):
     row = c.fetchone()
     conn.close()
     if row:
+        print(row)
         return {
             "similarity_threshold": row[0],
             "no_mask_threshold": row[1],
@@ -261,6 +267,7 @@ def get_tenant_config(tenant_id: str):
             "no_hardhat_threshold": row[3],
             "external_trigger_url": row[4]
         }
+        
     return None
 
 def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url):
@@ -290,10 +297,10 @@ def add_face_record(tenant_id, camera_id, name, embedding, metadata) -> int:
     c = conn.cursor()
     embedding_json = json.dumps(embedding)
     metadata_json = json.dumps(metadata)
-    query = "INSERT INTO faces (tenant_id, camera_id, name, embedding, metadata) VALUES (?, ?, ?, ?, ?)"
-    c.execute(format_query(query, db_type), (tenant_id, camera_id, name, embedding_json, metadata_json))
+    face_id = generate_uuid()
+    query = "INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata) VALUES (?, ?, ?, ?, ?, ?)"
+    c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding_json, metadata_json))
     conn.commit()
-    face_id = c.lastrowid
     conn.close()
     return face_id
 
@@ -343,13 +350,16 @@ def save_violation_to_db(
     violation_image_path,
     details=""
 ):
+    id = generate_uuid()
     conn, db_type = get_connection()
     c = conn.cursor()
     query = """
-    INSERT INTO violations (tenant_id, camera_id, violation_timestamp, face_id, violation_type, violation_image_path, details)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO violations (id, tenant_id, camera_id, violation_timestamp, face_id, violation_type, violation_image_path, details)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
+    print("Execute")
     c.execute(format_query(query, db_type), (
+        id,
         tenant_id,
         camera_id,
         violation_timestamp,
@@ -358,8 +368,10 @@ def save_violation_to_db(
         violation_image_path,
         details
     ))
+    print("done")
     conn.commit()
     conn.close()
+
 
 # ----------------- Detection & Recognition ----------------- #
 def detect_objects(image):
