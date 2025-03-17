@@ -39,7 +39,11 @@ from helper import (
     delete_face_record,
     add_or_update_tenant_config,
     delete_tenant_config,
-    DB_PATH
+    update_video_status,
+    increment_frames_processed,
+    increment_violations_detected,
+    get_connection,
+    format_query
 )
 from pydantic import BaseModel, HttpUrl
 from typing import Dict
@@ -51,8 +55,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Global in-memory state for runtime tracking
-videos_info = {}  # video_id -> metadata dict
+# Global in-memory dictionary for tracking violation timing only.
 violation_timers = {}
 
 UPLOAD_DIR = "uploads"
@@ -79,6 +82,37 @@ def get_threshold_for_violation(config: dict, vio: str) -> int:
     elif vio == "NO-Hardhat":
         return config.get("no_hardhat_threshold", 999)
     return 999
+
+######################################################################
+# Helper function to fetch a video record by tenant & camera from the DB
+######################################################################
+def get_video_record_by_tenant_camera(tenant_id: str, camera_id: str):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = """
+    SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected 
+    FROM videos WHERE tenant_id = ? AND camera_id = ?
+    """
+    c.execute(format_query(query, db_type), (tenant_id, camera_id))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "video_id": row[0],
+            "tenant_id": row[1],
+            "camera_id": row[2],
+            "is_live": bool(row[3]),
+            "filename": row[4],
+            "stream_url": row[5],
+            "status": row[6],
+            "size": row[7],
+            "fps": row[8],
+            "total_frames": row[9],
+            "duration": row[10],
+            "frames_processed": row[11],
+            "violations_detected": row[12]
+        }
+    return None
 
 ######################################################################
 # 1) Video/Stream Registration Endpoint
@@ -115,21 +149,6 @@ async def upload_video(
             is_live=True,
             stream_url=stream_url
         )
-        videos_info[video_id] = {
-            "video_id": video_id,
-            "tenant_id": tenant_id,
-            "camera_id": camera_id,
-            "is_live": True,
-            "stream_url": stream_url,
-            "filename": None,
-            "size": 0,
-            "fps": 0,
-            "total_frames": 0,
-            "duration": 0,
-            "status": "registered",
-            "frames_processed": 0,
-            "violations_detected": 0
-        }
         return {
             "video_id": video_id,
             "tenant_id": tenant_id,
@@ -169,21 +188,6 @@ async def upload_video(
             total_frames=total_frames,
             duration=duration
         )
-        videos_info[video_id] = {
-            "video_id": video_id,
-            "tenant_id": tenant_id,
-            "camera_id": camera_id,
-            "is_live": False,
-            "stream_url": None,
-            "filename": file_location,
-            "size": size_bytes,
-            "fps": fps,
-            "total_frames": total_frames,
-            "duration": duration,
-            "status": "uploaded",
-            "frames_processed": 0,
-            "violations_detected": 0
-        }
         return {
             "video_id": video_id,
             "tenant_id": tenant_id,
@@ -201,31 +205,23 @@ async def upload_video(
 ######################################################################
 @app.get("/videos")
 def list_videos():
-    # Retrieve persistent video records from the DB
+    # Now fetch all video records directly from the database
     db_videos = list_video_records()
-    # Merge with runtime state if available
-    for video in db_videos:
-        vid_id = video["video_id"]
-        if vid_id in videos_info:
-            runtime_info = videos_info[vid_id]
-            video["frames_processed"] = runtime_info.get("frames_processed", 0)
-            video["violations_detected"] = runtime_info.get("violations_detected", 0)
-        else:
-            video["frames_processed"] = 0
-            video["violations_detected"] = 0
     return {"videos": db_videos}
 
 @app.get("/status")
 def get_status():
+    # For status we now query the DB for each video's status
+    db_videos = list_video_records()
     status_list = []
-    for vid_id, meta in videos_info.items():
+    for video in db_videos:
         status_list.append({
-            "video_id": vid_id,
-            "tenant_id": meta["tenant_id"],
-            "camera_id": meta["camera_id"],
-            "status": meta["status"],
-            "frames_processed": meta["frames_processed"],
-            "violations_detected": meta["violations_detected"]
+            "video_id": video["video_id"],
+            "tenant_id": video["tenant_id"],
+            "camera_id": video["camera_id"],
+            "status": video["status"],
+            "frames_processed": video.get("frames_processed", 0),
+            "violations_detected": video.get("violations_detected", 0)
         })
     return {"videos_status": status_list}
 
@@ -236,15 +232,9 @@ def get_stats():
     db_videos = list_video_records()
     for video in db_videos:
         total_duration += video["duration"] if video["duration"] else 0
-        vid_id = video["video_id"]
-        if vid_id in videos_info:
-            violation_counts[vid_id] = videos_info[vid_id].get("violations_detected", 0)
-        else:
-            violation_counts[vid_id] = 0
-    total_processed_duration = sum(v.get("frames_processed", 0) / (v.get("fps", 30) or 30) for v in videos_info.values())
+        violation_counts[video["video_id"]] = video.get("violations_detected", 0)
     return {
         "total_video_duration": total_duration,
-        "total_processed_duration": total_processed_duration,
         "violation_counts_per_video": violation_counts
     }
 
@@ -265,34 +255,35 @@ def db_status():
         db_url = os.getenv("DATABASE_URL", "Not set")
         return {"db_type": "postgres", "status": status, "database_url": db_url}
     else:
+        from helper import DB_PATH
         return {"db_type": "sqlite", "status": status, "database_path": DB_PATH}
 
 ######################################################################
 # 3) Processing Videos/Streams in Background
 ######################################################################
-async def process_video_stream(video_id: int):
-    if video_id not in videos_info:
+async def process_video_stream(video_id: str):
+    video_record = get_video_record(video_id)
+    if not video_record:
         return
-    meta = videos_info[video_id]
-    tenant_id = meta["tenant_id"]
-    camera_id = meta["camera_id"]
+    tenant_id = video_record["tenant_id"]
+    camera_id = video_record["camera_id"]
     config = get_tenant_config(tenant_id)
     if not config:
         logging.error(f"[ERROR] No tenant configuration for tenant {tenant_id}")
-        meta["status"] = "error"
+        update_video_status(video_id, "error")
         return
 
     similarity_threshold = config["similarity_threshold"]
     external_trigger_url = config["external_trigger_url"]
 
-    cap_source = meta["stream_url"] if meta["is_live"] else meta["filename"]
+    cap_source = video_record["stream_url"] if video_record["is_live"] else video_record["filename"]
     cap = cv2.VideoCapture(cap_source)
     if not cap.isOpened():
         logging.error(f"[ERROR] Cannot open source for video_id {video_id}")
-        meta["status"] = "error"
+        update_video_status(video_id, "error")
         return
 
-    meta["status"] = "processing"
+    update_video_status(video_id, "processing")
     use_gpu = torch.cuda.is_available()
     target_fps = 15 if use_gpu else 3
     original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -337,7 +328,6 @@ async def process_video_stream(video_id: int):
                         continue
                     if compare_embeddings(embedding, face_rec["embedding"], similarity_threshold):
                         matched_face_id.append(face_rec["face_id"])
-                        # break
                 if not matched_face_id:
                     continue
 
@@ -345,7 +335,7 @@ async def process_video_stream(video_id: int):
                     for face_id in matched_face_id:
                         key = (tenant_id, camera_id, face_id, vio)
                         threshold_minutes = get_threshold_for_violation(config, vio)
-                        threshold_seconds = threshold_minutes * 1
+                        threshold_seconds = threshold_minutes * 60  # convert minutes to seconds
                         if key not in violation_timers:
                             violation_timers[key] = current_time
                         else:
@@ -362,38 +352,35 @@ async def process_video_stream(video_id: int):
                                 }
                                 save_violation_to_db(**violation_record)
                                 violation_timers[key] = current_time
-                                meta["violations_detected"] += 1
+                                increment_violations_detected(video_id)
                                 if external_trigger_url:
                                     payload = violation_record.copy()
                                     asyncio.create_task(trigger_external_event(external_trigger_url, payload))
                 for key in list(violation_timers.keys()):
-                    if key[0] == tenant_id and key[1] == camera_id and key[2] == matched_face_id and key[3] not in violations_found:
+                    # Remove timers for violations no longer detected
+                    if key[0] == tenant_id and key[1] == camera_id and key[2] in matched_face_id and key[3] not in violations_found:
                         violation_timers.pop(key, None)
 
-        meta["frames_processed"] += frame_skip_interval
+        increment_frames_processed(video_id, frame_skip_interval)
         await asyncio.sleep(0)
     cap.release()
-    meta["status"] = "done"
+    update_video_status(video_id, "done")
     logging.info(f"[INFO] Finished processing video_id={video_id} (tenant={tenant_id}, camera={camera_id}).")
 
 @app.post("/process")
-async def process_videos(
-    video_ids: Union[List[str], str] = Body(...),
-    background_tasks: BackgroundTasks = None
-):
-    if isinstance(video_ids, str) and video_ids.strip() == "*":
-        vids_to_run = list(videos_info.keys())
-    elif isinstance(video_ids, list):
-        vids_to_run = video_ids
-    else:
-        raise HTTPException(status_code=400, detail="Invalid input. Must be '*' or list of video IDs.")
-    if not vids_to_run:
-        return {"message": "No videos to process."}
+async def process_videos(background_tasks: BackgroundTasks):
+    # Query DB for videos with status 'uploaded' (offline) or 'registered' (live)
+    videos = list_video_records()
+    vids_to_run = []
+    for video in videos:
+        if video["status"] in ("uploaded", "registered"):
+            vids_to_run.append(video["video_id"])
     triggered = []
     for vid in vids_to_run:
-        if vid in videos_info:
-            background_tasks.add_task(process_video_stream, vid)
-            triggered.append(vid)
+        background_tasks.add_task(process_video_stream, vid)
+        triggered.append(vid)
+    if not triggered:
+        return {"message": "No videos to process."}
     return {"message": f"Triggered processing for videos: {triggered}"}
 
 ######################################################################
@@ -407,8 +394,6 @@ def get_config(tenant_id: str):
     return config
 
 @app.post("/tenants/{tenant_id}/config")
-
-
 def create_config(tenant_id: str, config: TenantConfig):
     add_or_update_tenant_config(
         tenant_id,
@@ -505,16 +490,15 @@ def remove_face(tenant_id: str, face_id: int):
 # 6) Video Deletion and Update Endpoints
 ######################################################################
 @app.delete("/videos/{video_id}")
-def delete_video(video_id: int):
+def delete_video(video_id: str):
     success = delete_video_record(video_id)
     if not success:
         raise HTTPException(status_code=404, detail="Video not found.")
-    videos_info.pop(video_id, None)
     return {"message": f"Video {video_id} deleted successfully."}
 
 @app.put("/videos/{video_id}")
 async def update_video(
-    video_id: int,
+    video_id: str,
     tenant_id: Optional[str] = Form(None),
     camera_id: Optional[str] = Form(None),
     is_live: Optional[bool] = Form(None),
@@ -559,8 +543,6 @@ async def update_video(
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields provided to update.")
     update_video_record(video_id, update_fields)
-    if video_id in videos_info:
-        videos_info[video_id].update(update_fields)
     return {"message": f"Video {video_id} updated successfully."}
 
 ######################################################################
@@ -575,3 +557,29 @@ async def trigger_event(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="tenant_id, camera_id, and event_url are required.")
     status_code, response_text = await trigger_external_event(event_url, payload)
     return {"status_code": status_code, "response_text": response_text}
+
+######################################################################
+# 8) Tenants & Live URL Endpoints
+######################################################################
+@app.get("/tenants")
+def list_tenants():
+    # List distinct tenants and their camera IDs from the videos table.
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT DISTINCT tenant_id, camera_id FROM videos"
+    c.execute(format_query(query, db_type))
+    rows = c.fetchall()
+    conn.close()
+    tenants = [{"tenant_id": row[0], "camera_id": row[1]} for row in rows]
+    return {"tenants": tenants}
+
+@app.put("/tenants/{tenant_id}/cameras/{camera_id}/live-url")
+def update_live_url(tenant_id: str, camera_id: str, stream_url: str = Body(...)):
+    # Update the live stream URL for a specific tenant and camera.
+    video = get_video_record_by_tenant_camera(tenant_id, camera_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Camera not found for the given tenant.")
+    if not video["is_live"]:
+        raise HTTPException(status_code=400, detail="The specified camera is not a live feed.")
+    update_video_record(video["video_id"], {"stream_url": stream_url})
+    return {"message": "Live URL updated successfully."}

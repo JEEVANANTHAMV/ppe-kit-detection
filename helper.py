@@ -66,7 +66,7 @@ REQUIRED_ITEMS = {"No-Mask", "No-Safety-Vest", "No-Hardhat"}
 def init_db():
     conn, db_type = get_connection()
     c = conn.cursor()
-    # Create tenant_config table with separate columns for each violation threshold
+    # Tenant configuration table
     query = """
     CREATE TABLE IF NOT EXISTS tenant_config (
         tenant_id TEXT PRIMARY KEY,
@@ -78,10 +78,10 @@ def init_db():
     )
     """
     c.execute(format_query(query, db_type))
-    # Videos table
+    # Videos table – note: using TEXT for video_id (UUID) and adding processing status columns.
     query = """
     CREATE TABLE IF NOT EXISTS videos (
-        video_id SERIAL PRIMARY KEY,
+        video_id TEXT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
         camera_id TEXT NOT NULL,
         is_live INTEGER NOT NULL,
@@ -92,6 +92,8 @@ def init_db():
         total_frames INTEGER DEFAULT 0,
         duration REAL DEFAULT 0,
         status TEXT DEFAULT 'uploaded',
+        frames_processed INTEGER DEFAULT 0,
+        violations_detected INTEGER DEFAULT 0,
         UNIQUE(tenant_id, camera_id)
     )
     """
@@ -99,7 +101,7 @@ def init_db():
     # Faces table
     query = """
     CREATE TABLE IF NOT EXISTS faces (
-        face_id SERIAL PRIMARY KEY,
+        face_id TEXT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
         camera_id TEXT NOT NULL,
         name TEXT,
@@ -111,11 +113,11 @@ def init_db():
     # Violations table
     query = """
     CREATE TABLE IF NOT EXISTS violations (
-        id SERIAL PRIMARY KEY,
+        id TEXT PRIMARY KEY,
         tenant_id TEXT,
         camera_id TEXT,
         violation_timestamp REAL,
-        face_id INTEGER,
+        face_id TEXT,
         violation_type TEXT,
         violation_image_path TEXT,
         details TEXT
@@ -145,15 +147,15 @@ def insert_video_record(
     fps: float = 0,
     total_frames: int = 0,
     duration: float = 0
-) -> int:
+) -> str:
     conn, db_type = get_connection()
     c = conn.cursor()
     video_id = generate_uuid()
-    query = """
-    INSERT INTO videos (video_id, tenant_id, camera_id, is_live, filename, stream_url, size, fps, total_frames, duration, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
     status = "registered" if is_live else "uploaded"
+    query = """
+    INSERT INTO videos (video_id, tenant_id, camera_id, is_live, filename, stream_url, size, fps, total_frames, duration, status, frames_processed, violations_detected)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+    """
     c.execute(format_query(query, db_type), (
         video_id,
         tenant_id,
@@ -174,7 +176,7 @@ def insert_video_record(
 def list_video_records():
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration FROM videos"
+    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected FROM videos"
     c.execute(format_query(query, db_type))
     rows = c.fetchall()
     conn.close()
@@ -191,14 +193,16 @@ def list_video_records():
             "size": row[7],
             "fps": row[8],
             "total_frames": row[9],
-            "duration": row[10]
+            "duration": row[10],
+            "frames_processed": row[11],
+            "violations_detected": row[12]
         })
     return videos
 
-def get_video_record(video_id: int):
+def get_video_record(video_id: str):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration FROM videos WHERE video_id = ?"
+    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected FROM videos WHERE video_id = ?"
     c.execute(format_query(query, db_type), (video_id,))
     row = c.fetchone()
     conn.close()
@@ -214,11 +218,13 @@ def get_video_record(video_id: int):
             "size": row[7],
             "fps": row[8],
             "total_frames": row[9],
-            "duration": row[10]
+            "duration": row[10],
+            "frames_processed": row[11],
+            "violations_detected": row[12]
         }
     return None
 
-def update_video_record(video_id: int, fields: dict) -> bool:
+def update_video_record(video_id: str, fields: dict) -> bool:
     if not fields:
         return False
     conn, db_type = get_connection()
@@ -232,7 +238,7 @@ def update_video_record(video_id: int, fields: dict) -> bool:
     conn.close()
     return True
 
-def delete_video_record(video_id: int) -> bool:
+def delete_video_record(video_id: str) -> bool:
     conn, db_type = get_connection()
     c = conn.cursor()
     query = "SELECT filename FROM videos WHERE video_id = ?"
@@ -250,6 +256,30 @@ def delete_video_record(video_id: int) -> bool:
         os.remove(filename)
     return True
 
+def update_video_status(video_id: str, status: str):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "UPDATE videos SET status = ? WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (status, video_id))
+    conn.commit()
+    conn.close()
+
+def increment_frames_processed(video_id: str, frames: int):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "UPDATE videos SET frames_processed = frames_processed + ? WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (frames, video_id))
+    conn.commit()
+    conn.close()
+
+def increment_violations_detected(video_id: str):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "UPDATE videos SET violations_detected = violations_detected + 1 WHERE video_id = ?"
+    c.execute(format_query(query, db_type), (video_id,))
+    conn.commit()
+    conn.close()
+
 # ----------------- Tenant Config Operations ----------------- #
 def get_tenant_config(tenant_id: str):
     conn, db_type = get_connection()
@@ -259,7 +289,6 @@ def get_tenant_config(tenant_id: str):
     row = c.fetchone()
     conn.close()
     if row:
-        print(row)
         return {
             "similarity_threshold": row[0],
             "no_mask_threshold": row[1],
@@ -267,7 +296,6 @@ def get_tenant_config(tenant_id: str):
             "no_hardhat_threshold": row[3],
             "external_trigger_url": row[4]
         }
-        
     return None
 
 def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url):
@@ -292,7 +320,7 @@ def delete_tenant_config(tenant_id: str):
     conn.close()
 
 # ----------------- Faces Table Operations ----------------- #
-def add_face_record(tenant_id, camera_id, name, embedding, metadata) -> int:
+def add_face_record(tenant_id, camera_id, name, embedding, metadata) -> str:
     conn, db_type = get_connection()
     c = conn.cursor()
     embedding_json = json.dumps(embedding)
@@ -357,7 +385,6 @@ def save_violation_to_db(
     INSERT INTO violations (id, tenant_id, camera_id, violation_timestamp, face_id, violation_type, violation_image_path, details)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
-    print("Execute")
     c.execute(format_query(query, db_type), (
         id,
         tenant_id,
@@ -368,10 +395,8 @@ def save_violation_to_db(
         violation_image_path,
         details
     ))
-    print("done")
     conn.commit()
     conn.close()
-
 
 # ----------------- Detection & Recognition ----------------- #
 def detect_objects(image):
