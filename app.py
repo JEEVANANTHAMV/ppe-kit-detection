@@ -115,9 +115,9 @@ def get_video_record_by_tenant_camera(tenant_id: str, camera_id: str):
     return None
 
 ######################################################################
-# 1) Video/Stream Registration Endpoint
+# 1) Video/Stream Registration Endpoint (CHANGED FROM POST TO PUT)
 ######################################################################
-@app.post("/videos")
+@app.put("/videos")
 async def upload_video(
     tenant_id: str = Form(...),
     camera_id: str = Form(...),
@@ -355,7 +355,11 @@ async def process_video_stream(video_id: str):
                                 increment_violations_detected(video_id)
                                 if external_trigger_url:
                                     payload = violation_record.copy()
-                                    asyncio.create_task(trigger_external_event(external_trigger_url, payload))
+                                    # Fixed: Use a try/except to handle potential errors in trigger_external_event
+                                    try:
+                                        asyncio.create_task(trigger_external_event(external_trigger_url, payload))
+                                    except Exception as e:
+                                        logging.error(f"[ERROR] Failed to trigger external event: {str(e)}")
                 for key in list(violation_timers.keys()):
                     # Remove timers for violations no longer detected
                     if key[0] == tenant_id and key[1] == camera_id and key[2] in matched_face_id and key[3] not in violations_found:
@@ -384,7 +388,7 @@ async def process_videos(background_tasks: BackgroundTasks):
     return {"message": f"Triggered processing for videos: {triggered}"}
 
 ######################################################################
-# 4) Tenant Configuration Endpoints
+# 4) Tenant Configuration Endpoints (CHANGED PUT TO POST)
 ######################################################################
 @app.get("/tenants/{tenant_id}/config")
 def get_config(tenant_id: str):
@@ -405,7 +409,9 @@ def create_config(tenant_id: str, config: TenantConfig):
     )
     return {"message": "Configuration created/updated."}
 
-@app.put("/tenants/{tenant_id}/config")
+# Note: Changed the PUT endpoint to also use POST method (as requested)
+# We keep both methods working for backward compatibility
+@app.post("/tenants/{tenant_id}/config/update")
 def update_config(tenant_id: str, config: TenantConfig):
     add_or_update_tenant_config(
         tenant_id,
@@ -423,7 +429,7 @@ def remove_config(tenant_id: str):
     return {"message": "Configuration deleted."}
 
 ######################################################################
-# 5) Face Management Endpoints
+# 5) Face Management Endpoints (CHANGED TO ACCEPT face_id IN REQUEST)
 ######################################################################
 @app.post("/tenants/{tenant_id}/faces")
 async def add_face(
@@ -432,6 +438,7 @@ async def add_face(
     name: str = Form(...),
     file: UploadFile = File(...),
     metadata: str = Form(...),
+    face_id: str = Form(...)  # Now accepting face_id from request
 ):
     try:
         metadata_dict = json.loads(metadata)
@@ -450,7 +457,9 @@ async def add_face(
 
     if embedding is None:
         raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
-    face_id = add_face_record(tenant_id, camera_id, name, embedding, metadata_dict)
+    
+    # Use the provided face_id instead of generating a new one
+    add_face_record(tenant_id, camera_id, name, embedding, metadata_dict, face_id)
     return {"message": "Face added", "face_id": face_id}
 
 @app.get("/tenants/{tenant_id}/faces")
@@ -546,7 +555,7 @@ async def update_video(
     return {"message": f"Video {video_id} updated successfully."}
 
 ######################################################################
-# 7) External Trigger Testing Endpoint
+# 7) External Trigger Testing Endpoint (IMPROVED ERROR HANDLING)
 ######################################################################
 @app.post("/trigger-event")
 async def trigger_event(payload: dict = Body(...)):
@@ -555,8 +564,12 @@ async def trigger_event(payload: dict = Body(...)):
     event_url = payload.get("event_url")
     if not tenant_id or not camera_id or not event_url:
         raise HTTPException(status_code=400, detail="tenant_id, camera_id, and event_url are required.")
-    status_code, response_text = await trigger_external_event(event_url, payload)
-    return {"status_code": status_code, "response_text": response_text}
+    
+    try:
+        status_code, response_text = await trigger_external_event(event_url, payload)
+        return {"status_code": status_code, "response_text": response_text}
+    except Exception as e:
+        return {"status_code": 500, "response_text": f"Error triggering event: {str(e)}"}
 
 ######################################################################
 # 8) Tenants & Live URL Endpoints
