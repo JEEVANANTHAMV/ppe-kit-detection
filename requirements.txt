@@ -10,3 +10,5 @@ uvicorn==0.33.0
 tf-keras
 python-multipart
 psycopg2-binary==2.9.10
+keras==2.10
+python-dotenv

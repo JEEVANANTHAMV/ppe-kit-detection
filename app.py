@@ -6,7 +6,7 @@ import asyncio
 import datetime
 import torch
 from typing import List, Union, Optional
-
+from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -47,7 +47,7 @@ from helper import (
 )
 from pydantic import BaseModel, HttpUrl
 from typing import Dict
-
+load_dotenv()
 app = FastAPI(title="Safety Violation Detector")
 init_db()
 logging.basicConfig(
@@ -438,7 +438,7 @@ async def add_face(
     name: str = Form(...),
     file: UploadFile = File(...),
     metadata: str = Form(...),
-    face_id: str = Form(...)  # Now accepting face_id from request
+    face_id: str = Form(...) # Now accepting face_id from request
 ):
     try:
         metadata_dict = json.loads(metadata)

@@ -320,17 +320,17 @@ def delete_tenant_config(tenant_id: str):
     conn.close()
 
 # ----------------- Faces Table Operations ----------------- #
-def add_face_record(tenant_id, camera_id, name, embedding, metadata) -> str:
+def add_face_record(tenant_id, camera_id, name, embedding, metadata, face_id) -> str:
     conn, db_type = get_connection()
     c = conn.cursor()
     embedding_json = json.dumps(embedding)
     metadata_json = json.dumps(metadata)
-    face_id = generate_uuid()
+    # face_id = generate_uuid()
     query = "INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata) VALUES (?, ?, ?, ?, ?, ?)"
     c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding_json, metadata_json))
     conn.commit()
     conn.close()
-    return face_id
+    return 
 
 def update_face_record(face_id, tenant_id, camera_id, name, embedding, metadata):
     conn, db_type = get_connection()
