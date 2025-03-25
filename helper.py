@@ -11,6 +11,7 @@ from deepface import DeepFace
 from ultralytics import YOLO
 import logging
 import uuid
+import faiss
 
 # Try to import psycopg2 for Postgres support
 try:
@@ -52,15 +53,19 @@ def format_query(query, db_type):
 # ----------------- YOLO Initialization ----------------- #
 MODEL_PATH = "weights/best.pt"
 model = YOLO(MODEL_PATH)
+gpu_semaphore = None
+
 try:
     import torch
     if torch.cuda.is_available():
         model.to("cuda")
+        import asyncio
+        gpu_semaphore = asyncio.Semaphore(4)  # Limit to 4 concurrent GPU operations
 except Exception:
     pass
 
 # ----------------- Required Items ----------------- #
-REQUIRED_ITEMS = {"No-Mask", "No-Safety-Vest", "No-Hardhat"}
+REQUIRED_ITEMS = {"NO-Mask", "NO-Safety-Vest", "NO-Hardhat"}
 
 # ----------------- Database Initialization ----------------- #
 def init_db():
@@ -323,14 +328,21 @@ def delete_tenant_config(tenant_id: str):
 def add_face_record(tenant_id, camera_id, name, embedding, metadata, face_id) -> str:
     conn, db_type = get_connection()
     c = conn.cursor()
+    
+    # Check if face_id already exists
+    query = "SELECT COUNT(*) FROM faces WHERE face_id = ?"
+    c.execute(format_query(query, db_type), (face_id,))
+    if c.fetchone()[0] > 0:
+        conn.close()
+        raise ValueError(f"Face ID {face_id} already exists")
+        
     embedding_json = json.dumps(embedding)
     metadata_json = json.dumps(metadata)
-    # face_id = generate_uuid()
     query = "INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata) VALUES (?, ?, ?, ?, ?, ?)"
     c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding_json, metadata_json))
     conn.commit()
     conn.close()
-    return 
+    return face_id
 
 def update_face_record(face_id, tenant_id, camera_id, name, embedding, metadata):
     conn, db_type = get_connection()
@@ -399,6 +411,12 @@ def save_violation_to_db(
     conn.close()
 
 # ----------------- Detection & Recognition ----------------- #
+async def detect_objects_with_semaphore(image):
+    if gpu_semaphore:
+        async with gpu_semaphore:
+            return detect_objects(image)
+    return detect_objects(image)
+
 def detect_objects(image):
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = model(image_rgb, verbose=False)[0]
@@ -439,46 +457,44 @@ def check_violations(class_confidences, threshold=0.5):
     return violations_found
 
 def save_annotated_plot(original_bgr_image, boxes, class_names, annotated_image_rgb, colors, confidence_threshold, video_source):
-    original_image_rgb = cv2.cvtColor(original_bgr_image, cv2.COLOR_BGR2RGB)
-    class_labels = {}
-    for box in boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        confidence = float(box.conf[0])
-        if confidence > confidence_threshold:
-            class_id = int(box.cls[0])
-            class_name = class_names[class_id]
-            color = colors[class_id % len(colors)].tolist()
-            cv2.rectangle(annotated_image_rgb, (x1, y1), (x2, y2), color, 2)
-            class_labels[class_name] = color
-    plt.figure(figsize=(12, 6))
-    plt.subplot(1, 2, 1)
-    plt.title("Original Frame")
-    plt.imshow(original_image_rgb)
-    plt.axis("off")
-    plt.subplot(1, 2, 2)
-    plt.title("Detected Objects")
-    plt.imshow(annotated_image_rgb)
-    plt.axis("off")
-    legend_handles = []
-    for class_name, color in class_labels.items():
-        normalized_color = np.array(color) / 255.0
-        legend_handles.append(plt.Line2D([0], [0], marker="o", color="w",
-                                         label=class_name, markerfacecolor=normalized_color, markersize=10))
-    if legend_handles:
-        plt.legend(handles=legend_handles, loc="upper right", title="Classes")
-    plt.tight_layout()
     output_dir = os.getenv("OUTPUT_DIR", "./violation_images")
     os.makedirs(output_dir, exist_ok=True)
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_filename = f"detected_objects_{timestamp_str}.png"
     output_path = os.path.join(output_dir, output_filename)
-    plt.savefig(output_path)
-    plt.close()
+    
+    # Create a side-by-side image
+    h, w = original_bgr_image.shape[:2]
+    combined_image = np.zeros((h, w*2, 3), dtype=np.uint8)
+    combined_image[:, :w] = original_bgr_image
+    combined_image[:, w:] = cv2.cvtColor(annotated_image_rgb, cv2.COLOR_RGB2BGR)
+    
+    # Add class labels
+    y_offset = 30
+    for class_name, color in class_names.items():
+        cv2.putText(combined_image, class_name, (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        y_offset += 30
+    
+    cv2.imwrite(output_path, combined_image)
     logging.info(f"[INFO] Annotated result saved to: {output_path}")
     return output_path
 
 def extract_face_embedding(image, face_box):
     x1, y1, x2, y2 = face_box
+    
+    # Validate and clamp coordinates to image dimensions
+    height, width = image.shape[:2]
+    x1 = max(0, min(x1, width))
+    y1 = max(0, min(y1, height))
+    x2 = max(0, min(x2, width))
+    y2 = max(0, min(y2, height))
+    
+    # Check if box is valid
+    if x2 <= x1 or y2 <= y1 or (x2 - x1) < 10 or (y2 - y1) < 10:
+        logging.error("Invalid face box dimensions")
+        return None
+        
     face_crop = image[y1:y2, x1:x2]
     try:
         embeddings = DeepFace.represent(face_crop, model_name="Facenet", enforce_detection=False)
@@ -495,13 +511,13 @@ def calculate_cosine_distance(emb1, emb2):
     norm1 = np.linalg.norm(emb1)
     norm2 = np.linalg.norm(emb2)
     if norm1 == 0 or norm2 == 0:
-        return 1.0
+        return 0.0  # Return 0 similarity for zero vectors
     similarity = dot / (norm1 * norm2)
-    return 1 - similarity
+    return similarity  # Return similarity directly
 
 def compare_embeddings(embedding1, embedding2, threshold):
-    dist = calculate_cosine_distance(embedding1, embedding2)
-    return dist < threshold
+    similarity = calculate_cosine_distance(embedding1, embedding2)
+    return similarity >= threshold  # Compare similarity directly against threshold
 
 # ----------------- External Trigger ----------------- #
 async def trigger_external_event(event_url, payload):
@@ -512,3 +528,49 @@ async def trigger_external_event(event_url, payload):
         except Exception as e:
             logging.error("Error triggering external event: %s", e)
             return None, str(e)
+
+# Global FAISS index per tenant
+face_indices = {}
+face_id_maps = {}
+
+def build_face_index(tenant_id: str, faces: list):
+    if not faces:
+        return
+    
+    embeddings = []
+    face_ids = []
+    for face in faces:
+        embedding = np.array(face["embedding"], dtype=np.float32)
+        embeddings.append(embedding)
+        face_ids.append(face["face_id"])
+    
+    embeddings = np.array(embeddings)
+    d = embeddings.shape[1]  # embedding dimension
+    
+    # Build FAISS index
+    index = faiss.IndexFlatIP(d)  # Inner product for cosine similarity
+    faiss.normalize_L2(embeddings)  # Normalize vectors for cosine similarity
+    index.add(embeddings)
+    
+    face_indices[tenant_id] = index
+    face_id_maps[tenant_id] = face_ids
+
+def find_matching_faces(tenant_id: str, embedding: np.ndarray, similarity_threshold: float) -> list:
+    if tenant_id not in face_indices:
+        all_faces = list_face_records(tenant_id)
+        build_face_index(tenant_id, all_faces)
+    
+    if tenant_id not in face_indices:
+        return []
+        
+    query = np.array([embedding], dtype=np.float32)
+    faiss.normalize_L2(query)
+    
+    D, I = face_indices[tenant_id].search(query, k=10)  # Get top 10 matches
+    matches = []
+    
+    for i, dist in zip(I[0], D[0]):
+        if dist >= similarity_threshold and i < len(face_id_maps[tenant_id]):
+            matches.append(face_id_maps[tenant_id][i])
+            
+    return matches

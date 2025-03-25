@@ -27,8 +27,8 @@ from helper import (
     update_video_record,
     delete_video_record,
     list_face_records,
-    compare_embeddings,
-    detect_objects,
+    find_matching_faces,
+    detect_objects_with_semaphore,
     check_violations,
     save_annotated_plot,
     save_violation_to_db,
@@ -57,6 +57,7 @@ logging.basicConfig(
 
 # Global in-memory dictionary for tracking violation timing only.
 violation_timers = {}
+violation_timers_lock = asyncio.Lock()
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -262,114 +263,123 @@ def db_status():
 # 3) Processing Videos/Streams in Background
 ######################################################################
 async def process_video_stream(video_id: str):
-    video_record = get_video_record(video_id)
-    if not video_record:
-        return
-    tenant_id = video_record["tenant_id"]
-    camera_id = video_record["camera_id"]
-    config = get_tenant_config(tenant_id)
-    if not config:
-        logging.error(f"[ERROR] No tenant configuration for tenant {tenant_id}")
-        update_video_status(video_id, "error")
-        return
+    try:
+        video_record = get_video_record(video_id)
+        if not video_record:
+            logging.error(f"[ERROR] Video record not found for video_id {video_id}")
+            return
+            
+        tenant_id = video_record["tenant_id"]
+        camera_id = video_record["camera_id"]
+        config = get_tenant_config(tenant_id)
+        if not config:
+            logging.error(f"[ERROR] No tenant configuration for tenant {tenant_id}")
+            update_video_status(video_id, "error")
+            return
 
-    similarity_threshold = config["similarity_threshold"]
-    external_trigger_url = config["external_trigger_url"]
+        similarity_threshold = config["similarity_threshold"]
+        external_trigger_url = config["external_trigger_url"]
 
-    cap_source = video_record["stream_url"] if video_record["is_live"] else video_record["filename"]
-    cap = cv2.VideoCapture(cap_source)
-    if not cap.isOpened():
-        logging.error(f"[ERROR] Cannot open source for video_id {video_id}")
-        update_video_status(video_id, "error")
-        return
+        cap_source = video_record["stream_url"] if video_record["is_live"] else video_record["filename"]
+        cap = cv2.VideoCapture(cap_source)
+        if not cap.isOpened():
+            logging.error(f"[ERROR] Cannot open source for video_id {video_id}")
+            update_video_status(video_id, "error")
+            return
 
-    update_video_status(video_id, "processing")
-    use_gpu = torch.cuda.is_available()
-    target_fps = 15 if use_gpu else 3
-    original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_skip_interval = max(1, int(original_fps // target_fps))
-    frame_count = 0
+        try:
+            update_video_status(video_id, "processing")
+            use_gpu = torch.cuda.is_available()
+            target_fps = 15 if use_gpu else 3
+            original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            frame_skip_interval = max(1, int(original_fps // target_fps))
+            frame_count = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-        if frame_count % frame_skip_interval != 0:
-            continue
-
-        boxes, results, annotated_img, colors, class_confidences, violation_faces = await asyncio.to_thread(
-            detect_objects, frame
-        )
-        violations_found = check_violations(class_confidences, threshold=0.5)
-        if violations_found:
-            annotated_path = save_annotated_plot(
-                original_bgr_image=frame,
-                boxes=boxes,
-                class_names=results.names,
-                annotated_image_rgb=annotated_img,
-                colors=colors,
-                confidence_threshold=0.5,
-                video_source=cap_source
-            )
-            current_time = time.time()
-            for person_id, (x1, y1, x2, y2) in violation_faces:
-                embedding = extract_face_embedding(frame, (x1, y1, x2, y2))
-                if embedding is None:
-                    for vio in violations_found:
-                        key = (tenant_id, camera_id, person_id, vio)
-                        violation_timers.pop(key, None)
-                    continue
-
-                matched_face_id = []
-                all_faces = list_face_records(tenant_id)
-                for face_rec in all_faces:
-                    if face_rec["camera_id"] != camera_id:
+            while True:
+                try:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_count += 1
+                    if frame_count % frame_skip_interval != 0:
                         continue
-                    if compare_embeddings(embedding, face_rec["embedding"], similarity_threshold):
-                        matched_face_id.append(face_rec["face_id"])
-                if not matched_face_id:
+
+                    boxes, results, annotated_img, colors, class_confidences, violation_faces = await detect_objects_with_semaphore(frame)
+                    violations_found = check_violations(class_confidences, threshold=0.5)
+                    
+                    if violations_found:
+                        annotated_path = save_annotated_plot(
+                            original_bgr_image=frame,
+                            boxes=boxes,
+                            class_names=results.names,
+                            annotated_image_rgb=annotated_img,
+                            colors=colors,
+                            confidence_threshold=0.5,
+                            video_source=cap_source
+                        )
+                        current_time = time.time()
+                        for person_id, (x1, y1, x2, y2) in violation_faces:
+                            embedding = extract_face_embedding(frame, (x1, y1, x2, y2))
+                            face_id = "unknown_face"
+                            
+                            if embedding is not None:
+                                matched_face_ids = find_matching_faces(tenant_id, embedding, similarity_threshold)
+                                if matched_face_ids:
+                                    face_id = matched_face_ids[0]  # Use first matched face
+
+                            for vio in violations_found:
+                                key = (tenant_id, camera_id, face_id, vio)
+                                threshold_minutes = get_threshold_for_violation(config, vio)
+                                threshold_seconds = threshold_minutes * 60
+                                
+                                async with violation_timers_lock:
+                                    if key not in violation_timers:
+                                        violation_timers[key] = current_time
+                                    else:
+                                        elapsed = current_time - violation_timers[key]
+                                        if elapsed >= threshold_seconds:
+                                            violation_record = {
+                                                "tenant_id": tenant_id,
+                                                "camera_id": camera_id,
+                                                "violation_timestamp": current_time,
+                                                "face_id": face_id,
+                                                "violation_type": vio,
+                                                "violation_image_path": annotated_path,
+                                                "details": json.dumps({
+                                                    "person_id": person_id,
+                                                    "elapsed_seconds": elapsed,
+                                                    "face_detected": embedding is not None
+                                                })
+                                            }
+                                            save_violation_to_db(**violation_record)
+                                            violation_timers[key] = current_time
+                                            increment_violations_detected(video_id)
+                                            if external_trigger_url:
+                                                payload = violation_record.copy()
+                                                try:
+                                                    asyncio.create_task(trigger_external_event(external_trigger_url, payload))
+                                                except Exception as e:
+                                                    logging.error(f"[ERROR] Failed to trigger external event: {str(e)}")
+                                    
+                                # Clean up violation timers
+                                async with violation_timers_lock:
+                                    for key in list(violation_timers.keys()):
+                                        if key[0] == tenant_id and key[1] == camera_id and key[2] == face_id and key[3] not in violations_found:
+                                            violation_timers.pop(key, None)
+
+                    increment_frames_processed(video_id, frame_skip_interval)
+                    await asyncio.sleep(0)
+                except Exception as e:
+                    logging.error(f"[ERROR] Error processing frame {frame_count} for video {video_id}: {str(e)}")
                     continue
-
-                for vio in violations_found:
-                    for face_id in matched_face_id:
-                        key = (tenant_id, camera_id, face_id, vio)
-                        threshold_minutes = get_threshold_for_violation(config, vio)
-                        threshold_seconds = threshold_minutes * 60  # convert minutes to seconds
-                        if key not in violation_timers:
-                            violation_timers[key] = current_time
-                        else:
-                            elapsed = current_time - violation_timers[key]
-                            if elapsed >= threshold_seconds:
-                                violation_record = {
-                                    "tenant_id": tenant_id,
-                                    "camera_id": camera_id,
-                                    "violation_timestamp": current_time,
-                                    "face_id": face_id,
-                                    "violation_type": vio,
-                                    "violation_image_path": annotated_path,
-                                    "details": json.dumps({"person_id": person_id, "elapsed_seconds": elapsed})
-                                }
-                                save_violation_to_db(**violation_record)
-                                violation_timers[key] = current_time
-                                increment_violations_detected(video_id)
-                                if external_trigger_url:
-                                    payload = violation_record.copy()
-                                    # Fixed: Use a try/except to handle potential errors in trigger_external_event
-                                    try:
-                                        asyncio.create_task(trigger_external_event(external_trigger_url, payload))
-                                    except Exception as e:
-                                        logging.error(f"[ERROR] Failed to trigger external event: {str(e)}")
-                for key in list(violation_timers.keys()):
-                    # Remove timers for violations no longer detected
-                    if key[0] == tenant_id and key[1] == camera_id and key[2] in matched_face_id and key[3] not in violations_found:
-                        violation_timers.pop(key, None)
-
-        increment_frames_processed(video_id, frame_skip_interval)
-        await asyncio.sleep(0)
-    cap.release()
-    update_video_status(video_id, "done")
-    logging.info(f"[INFO] Finished processing video_id={video_id} (tenant={tenant_id}, camera={camera_id}).")
+        finally:
+            cap.release()
+            
+        update_video_status(video_id, "done")
+        logging.info(f"[INFO] Finished processing video_id={video_id} (tenant={tenant_id}, camera={camera_id}).")
+    except Exception as e:
+        logging.error(f"[ERROR] Fatal error processing video {video_id}: {str(e)}")
+        update_video_status(video_id, "error")
 
 @app.post("/process")
 async def process_videos(background_tasks: BackgroundTasks):
@@ -405,7 +415,7 @@ def create_config(tenant_id: str, config: TenantConfig):
         config.no_mask_threshold,
         config.no_safety_vest_threshold,
         config.no_hardhat_threshold,
-        config.external_trigger_url
+        str(config.external_trigger_url)
     )
     return {"message": "Configuration created/updated."}
 
@@ -470,7 +480,7 @@ def list_faces_endpoint(tenant_id: str):
 @app.put("/tenants/{tenant_id}/faces/{face_id}")
 async def update_face_endpoint(
     tenant_id: str,
-    face_id: int,
+    face_id: str,
     camera_id: str = Form(...),
     name: str = Form(...),
     file: UploadFile = File(...),
@@ -491,7 +501,7 @@ async def update_face_endpoint(
     return {"message": "Face updated successfully."}
 
 @app.delete("/tenants/{tenant_id}/faces/{face_id}")
-def remove_face(tenant_id: str, face_id: int):
+def remove_face(tenant_id: str, face_id: str):
     delete_face_record(face_id, tenant_id)
     return {"message": "Face deleted."}
 
@@ -518,6 +528,14 @@ async def update_video(
     video_record = get_video_record(video_id)
     if not video_record:
         raise HTTPException(status_code=404, detail="Video not found.")
+        
+    # Check if trying to upload file for live stream
+    if file is not None and (video_record["is_live"] or (is_live is not None and is_live)):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot upload file for live stream. Use stream_url instead."
+        )
+        
     update_fields = {}
     if tenant_id is not None:
         update_fields["tenant_id"] = tenant_id
@@ -530,24 +548,26 @@ async def update_video(
     if status is not None:
         update_fields["status"] = status
 
-    if file:
+    if file and not video_record["is_live"]:
         file_location = os.path.join(UPLOAD_DIR, file.filename)
         with open(file_location, "wb") as buffer:
             buffer.write(await file.read())
         cap = cv2.VideoCapture(file_location)
         if not cap.isOpened():
             raise HTTPException(status_code=400, detail=f"Cannot open video file: {file.filename}")
-        size_bytes = os.path.getsize(file_location)
-        original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        fps = original_fps
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps > 0 else 0
-        cap.release()
-        update_fields["filename"] = file_location
-        update_fields["size"] = size_bytes
-        update_fields["fps"] = fps
-        update_fields["total_frames"] = total_frames
-        update_fields["duration"] = duration
+        try:
+            size_bytes = os.path.getsize(file_location)
+            original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            fps = original_fps
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            update_fields["filename"] = file_location
+            update_fields["size"] = size_bytes
+            update_fields["fps"] = fps
+            update_fields["total_frames"] = total_frames
+            update_fields["duration"] = duration
+        finally:
+            cap.release()
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields provided to update.")
@@ -579,11 +599,11 @@ def list_tenants():
     # List distinct tenants and their camera IDs from the videos table.
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT DISTINCT tenant_id, camera_id FROM videos"
+    query = "SELECT DISTINCT tenant_id FROM tenant_config"
     c.execute(format_query(query, db_type))
     rows = c.fetchall()
     conn.close()
-    tenants = [{"tenant_id": row[0], "camera_id": row[1]} for row in rows]
+    tenants = [{"tenant_id": row[0]} for row in rows]
     return {"tenants": tenants}
 
 @app.put("/tenants/{tenant_id}/cameras/{camera_id}/live-url")
