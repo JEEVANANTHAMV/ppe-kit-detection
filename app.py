@@ -1,11 +1,8 @@
 import os
 import cv2
-import time
 import json
 import asyncio
-import datetime
-import torch
-from typing import List, Union, Optional
+from typing import Optional, Dict
 from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
@@ -18,7 +15,6 @@ from fastapi import (
 )
 import logging
 from helper import (
-    init_db,
     check_camera_exists,
     insert_video_record,
     get_tenant_config,
@@ -27,11 +23,6 @@ from helper import (
     update_video_record,
     delete_video_record,
     list_face_records,
-    find_matching_faces,
-    detect_objects_with_semaphore,
-    check_violations,
-    save_annotated_plot,
-    save_violation_to_db,
     extract_face_embedding,
     trigger_external_event,
     add_face_record,
@@ -40,24 +31,34 @@ from helper import (
     add_or_update_tenant_config,
     delete_tenant_config,
     update_video_status,
-    increment_frames_processed,
-    increment_violations_detected,
     get_connection,
-    format_query
+    format_query,
+    list_tenants,
+    update_tenant_status,
+    ensure_tables_exist
 )
+from video_processor import start_video_processing
 from pydantic import BaseModel, HttpUrl
-from typing import Dict
 load_dotenv()
 app = FastAPI(title="Safety Violation Detector")
-init_db()
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
+# Make sure database tables are properly set up
+try:
+    ensure_tables_exist()
+    logging.info("Database tables verified successfully")
+except Exception as e:
+    logging.error(f"Error ensuring database tables exist: {str(e)}")
+
 # Global in-memory dictionary for tracking violation timing only.
 violation_timers = {}
 violation_timers_lock = asyncio.Lock()
+
+# Store active video processing tasks
+active_processes = {}
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -71,6 +72,10 @@ class TenantConfig(BaseModel):
     no_safety_vest_threshold: int
     no_hardhat_threshold: int
     external_trigger_url: Optional[HttpUrl] = None
+    is_active: bool = True
+
+class TenantStatusUpdate(BaseModel):
+    is_active: bool
 
 ######################################################################
 # Helper function to get the threshold (in minutes) for a given violation
@@ -230,13 +235,28 @@ def get_status():
 def get_stats():
     total_duration = 0
     violation_counts = {}
+    processing_videos = []
     db_videos = list_video_records()
+    
     for video in db_videos:
         total_duration += video["duration"] if video["duration"] else 0
         violation_counts[video["video_id"]] = video.get("violations_detected", 0)
+        
+        if video["status"] == "processing":
+            processing_videos.append({
+                "video_id": video["video_id"],
+                "tenant_id": video["tenant_id"],
+                "camera_id": video["camera_id"],
+                "is_live": video["is_live"],
+                "frames_processed": video.get("frames_processed", 0),
+                "violations_detected": video.get("violations_detected", 0)
+            })
+    
     return {
         "total_video_duration": total_duration,
-        "violation_counts_per_video": violation_counts
+        "violation_counts_per_video": violation_counts,
+        "currently_processing": processing_videos,
+        "active_processes": len(active_processes)
     }
 
 @app.get("/db-status")
@@ -262,144 +282,103 @@ def db_status():
 ######################################################################
 # 3) Processing Videos/Streams in Background
 ######################################################################
-async def process_video_stream(video_id: str):
+async def monitor_video_process(video_id: str, process, status_queue):
     try:
-        video_record = get_video_record(video_id)
-        if not video_record:
-            logging.error(f"[ERROR] Video record not found for video_id {video_id}")
-            return
-            
-        tenant_id = video_record["tenant_id"]
-        camera_id = video_record["camera_id"]
-        config = get_tenant_config(tenant_id)
-        if not config:
-            logging.error(f"[ERROR] No tenant configuration for tenant {tenant_id}")
-            update_video_status(video_id, "error")
-            return
-
-        similarity_threshold = config["similarity_threshold"]
-        external_trigger_url = config["external_trigger_url"]
-
-        cap_source = video_record["stream_url"] if video_record["is_live"] else video_record["filename"]
-        cap = cv2.VideoCapture(cap_source)
-        if not cap.isOpened():
-            logging.error(f"[ERROR] Cannot open source for video_id {video_id}")
-            update_video_status(video_id, "error")
-            return
-
-        try:
-            update_video_status(video_id, "processing")
-            use_gpu = torch.cuda.is_available()
-            target_fps = 15 if use_gpu else 3
-            original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            frame_skip_interval = max(1, int(original_fps // target_fps))
-            frame_count = 0
-
-            while True:
-                try:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_count += 1
-                    if frame_count % frame_skip_interval != 0:
-                        continue
-
-                    boxes, results, annotated_img, colors, class_confidences, violation_faces = await detect_objects_with_semaphore(frame)
-                    violations_found = check_violations(class_confidences, threshold=0.5)
-                    
-                    if violations_found:
-                        annotated_path = save_annotated_plot(
-                            original_bgr_image=frame,
-                            boxes=boxes,
-                            class_names=results.names,
-                            annotated_image_rgb=annotated_img,
-                            colors=colors,
-                            confidence_threshold=0.5,
-                            video_source=cap_source
-                        )
-                        current_time = time.time()
-                        for person_id, (x1, y1, x2, y2) in violation_faces:
-                            embedding = extract_face_embedding(frame, (x1, y1, x2, y2))
-                            face_id = "unknown_face"
-                            
-                            if embedding is not None:
-                                matched_face_ids = find_matching_faces(tenant_id, embedding, similarity_threshold)
-                                if matched_face_ids:
-                                    face_id = matched_face_ids[0]  # Use first matched face
-
-                            for vio in violations_found:
-                                key = (tenant_id, camera_id, face_id, vio)
-                                threshold_minutes = get_threshold_for_violation(config, vio)
-                                threshold_seconds = threshold_minutes * 60
-                                
-                                async with violation_timers_lock:
-                                    if key not in violation_timers:
-                                        violation_timers[key] = current_time
-                                    else:
-                                        elapsed = current_time - violation_timers[key]
-                                        if elapsed >= threshold_seconds:
-                                            violation_record = {
-                                                "tenant_id": tenant_id,
-                                                "camera_id": camera_id,
-                                                "violation_timestamp": current_time,
-                                                "face_id": face_id,
-                                                "violation_type": vio,
-                                                "violation_image_path": annotated_path,
-                                                "details": json.dumps({
-                                                    "person_id": person_id,
-                                                    "elapsed_seconds": elapsed,
-                                                    "face_detected": embedding is not None
-                                                })
-                                            }
-                                            save_violation_to_db(**violation_record)
-                                            violation_timers[key] = current_time
-                                            increment_violations_detected(video_id)
-                                            if external_trigger_url:
-                                                payload = violation_record.copy()
-                                                try:
-                                                    asyncio.create_task(trigger_external_event(external_trigger_url, payload))
-                                                except Exception as e:
-                                                    logging.error(f"[ERROR] Failed to trigger external event: {str(e)}")
-                                    
-                                # Clean up violation timers
-                                async with violation_timers_lock:
-                                    for key in list(violation_timers.keys()):
-                                        if key[0] == tenant_id and key[1] == camera_id and key[2] == face_id and key[3] not in violations_found:
-                                            violation_timers.pop(key, None)
-
-                    increment_frames_processed(video_id, frame_skip_interval)
-                    await asyncio.sleep(0)
-                except Exception as e:
-                    logging.error(f"[ERROR] Error processing frame {frame_count} for video {video_id}: {str(e)}")
-                    continue
-        finally:
-            cap.release()
-            
-        update_video_status(video_id, "done")
-        logging.info(f"[INFO] Finished processing video_id={video_id} (tenant={tenant_id}, camera={camera_id}).")
-    except Exception as e:
-        logging.error(f"[ERROR] Fatal error processing video {video_id}: {str(e)}")
-        update_video_status(video_id, "error")
+        while True:
+            if not process.is_alive():
+                break
+                
+            try:
+                status, message = status_queue.get_nowait()
+                if status == "error":
+                    logging.error(f"[ERROR] Video {video_id}: {message}")
+                    update_video_status(video_id, "error")
+                    break
+                elif status == "stopped":
+                    logging.info(f"[INFO] Video {video_id}: {message}")
+                    update_video_status(video_id, "stopped")
+                    break
+            except:
+                pass
+                
+            await asyncio.sleep(1)
+    finally:
+        process.terminate()
+        process.join()
+        if video_id in active_processes:
+            del active_processes[video_id]
 
 @app.post("/process")
 async def process_videos(background_tasks: BackgroundTasks):
-    # Query DB for videos with status 'uploaded' (offline) or 'registered' (live)
     videos = list_video_records()
     vids_to_run = []
+    skipped_videos = []
+    
     for video in videos:
-        if video["status"] in ("uploaded", "registered"):
-            vids_to_run.append(video["video_id"])
+        # Skip videos that are not in the correct status
+        if video["status"] not in ("uploaded", "registered"):
+            continue
+            
+        config = get_tenant_config(video["tenant_id"])
+        
+        # Check if tenant config exists and is active
+        if not config:
+            update_video_status(video["video_id"], "no_config")
+            skipped_videos.append({"video_id": video["video_id"], "reason": "No tenant configuration found"})
+            continue
+            
+        if not config.get("is_active", False):
+            update_video_status(video["video_id"], "tenant_inactive")
+            skipped_videos.append({"video_id": video["video_id"], "reason": "Tenant is inactive"})
+            continue
+        
+        # Check if faces are registered for this tenant
+        faces = list_face_records(video["tenant_id"])
+        if not faces:
+            update_video_status(video["video_id"], "no_faces")
+            skipped_videos.append({"video_id": video["video_id"], "reason": "No employee faces registered"})
+            continue
+            
+        vids_to_run.append(video["video_id"])
+    
     triggered = []
     for vid in vids_to_run:
-        background_tasks.add_task(process_video_stream, vid)
+        if vid in active_processes:
+            continue
+            
+        video_record = get_video_record(vid)
+        config = get_tenant_config(video_record["tenant_id"])
+        
+        process, status_queue = start_video_processing(
+            video_id=vid,
+            tenant_id=video_record["tenant_id"],
+            camera_id=video_record["camera_id"],
+            similarity_threshold=config["similarity_threshold"],
+            violation_timers=violation_timers,
+            violation_timers_lock=violation_timers_lock
+        )
+        
+        active_processes[vid] = (process, status_queue)
+        background_tasks.add_task(monitor_video_process, vid, process, status_queue)
         triggered.append(vid)
-    if not triggered:
-        return {"message": "No videos to process."}
-    return {"message": f"Triggered processing for videos: {triggered}"}
+    
+    if not triggered and not skipped_videos:
+        return {"message": "No videos to process for active tenants."}
+    
+    return {
+        "triggered": triggered, 
+        "skipped": skipped_videos, 
+        "message": f"Triggered processing for {len(triggered)} videos, skipped {len(skipped_videos)} videos."
+    }
 
 ######################################################################
 # 4) Tenant Configuration Endpoints (CHANGED PUT TO POST)
 ######################################################################
+@app.get("/tenants")
+def list_tenants_endpoint():
+    tenants = list_tenants()
+    return {"tenants": tenants}
+
 @app.get("/tenants/{tenant_id}/config")
 def get_config(tenant_id: str):
     config = get_tenant_config(tenant_id)
@@ -409,29 +388,49 @@ def get_config(tenant_id: str):
 
 @app.post("/tenants/{tenant_id}/config")
 def create_config(tenant_id: str, config: TenantConfig):
+    existing = get_tenant_config(tenant_id)
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Configuration already exists. Use PUT /tenants/{tenant_id}/config/update to update."
+        )
     add_or_update_tenant_config(
         tenant_id,
         config.similarity_threshold,
         config.no_mask_threshold,
         config.no_safety_vest_threshold,
         config.no_hardhat_threshold,
-        str(config.external_trigger_url)
+        str(config.external_trigger_url),
+        config.is_active
     )
-    return {"message": "Configuration created/updated."}
+    return {"message": "Configuration created successfully."}
 
-# Note: Changed the PUT endpoint to also use POST method (as requested)
-# We keep both methods working for backward compatibility
-@app.post("/tenants/{tenant_id}/config/update")
+@app.put("/tenants/{tenant_id}/config/update")
 def update_config(tenant_id: str, config: TenantConfig):
+    existing = get_tenant_config(tenant_id)
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Configuration not found. Use POST /tenants/{tenant_id}/config to create."
+        )
     add_or_update_tenant_config(
         tenant_id,
         config.similarity_threshold,
         config.no_mask_threshold,
         config.no_safety_vest_threshold,
         config.no_hardhat_threshold,
-        config.external_trigger_url
+        str(config.external_trigger_url),
+        config.is_active
     )
-    return {"message": "Configuration updated."}
+    return {"message": "Configuration updated successfully."}
+
+@app.put("/tenants/{tenant_id}/status")
+def update_tenant_status_endpoint(tenant_id: str, status: TenantStatusUpdate):
+    existing = get_tenant_config(tenant_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Tenant not found.")
+    update_tenant_status(tenant_id, status.is_active)
+    return {"message": "Tenant status updated successfully."}
 
 @app.delete("/tenants/{tenant_id}/config")
 def remove_config(tenant_id: str):
@@ -441,36 +440,70 @@ def remove_config(tenant_id: str):
 ######################################################################
 # 5) Face Management Endpoints (CHANGED TO ACCEPT face_id IN REQUEST)
 ######################################################################
+class FaceCreate(BaseModel):
+    tenant_id: str
+    camera_id: str
+    name: str
+    face_id: Optional[str] = None
+    metadata: Optional[Dict] = None
+
+class FaceUpdate(BaseModel):
+    tenant_id: str
+    camera_id: str
+    name: Optional[str] = None
+    metadata: Optional[Dict] = None
+
 @app.post("/tenants/{tenant_id}/faces")
 async def add_face(
     tenant_id: str,
     camera_id: str = Form(...),
     name: str = Form(...),
+    face_id: str = Form(...),  # Required face_id from user
     file: UploadFile = File(...),
-    metadata: str = Form(...),
-    face_id: str = Form(...) # Now accepting face_id from request
+    metadata: Optional[str] = Form(None)
 ):
+    """
+    Add a new face for a tenant.
+    Validates that the camera exists for the tenant before adding the face.
+    Requires face_id to be provided by the user.
+    """
     try:
-        metadata_dict = json.loads(metadata)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid metadata JSON.")
+        # Parse metadata if provided
+        metadata_dict = json.loads(metadata) if metadata else None
+        metadata_json = json.dumps(metadata_dict) if metadata_dict else None
 
-    temp_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-    image = cv2.imread(temp_path)
-    if image is None:
+        # Save and process the face image
+        temp_path = os.path.join(UPLOAD_DIR, file.filename)
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
+        
+        image = cv2.imread(temp_path)
+        if image is None:
+            os.remove(temp_path)
+            raise HTTPException(status_code=400, detail="Invalid image.")
+            
+        # Extract face embedding
+        embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
         os.remove(temp_path)
-        raise HTTPException(status_code=400, detail="Invalid image.")
-    embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
-    os.remove(temp_path)
-
-    if embedding is None:
-        raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
-    
-    # Use the provided face_id instead of generating a new one
-    add_face_record(tenant_id, camera_id, name, embedding, metadata_dict, face_id)
-    return {"message": "Face added", "face_id": face_id}
+        
+        if embedding is None:
+            raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
+        
+        # Add face record
+        face_id = add_face_record(
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            face_id=face_id,  # Use provided face_id
+            name=name,
+            embedding=json.dumps(embedding),
+            metadata=metadata_json
+        )
+        
+        return {"face_id": face_id, "message": "Face added successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tenants/{tenant_id}/faces")
 def list_faces_endpoint(tenant_id: str):
@@ -478,27 +511,57 @@ def list_faces_endpoint(tenant_id: str):
     return {"faces": faces}
 
 @app.put("/tenants/{tenant_id}/faces/{face_id}")
-async def update_face_endpoint(
+async def update_face(
     tenant_id: str,
     face_id: str,
     camera_id: str = Form(...),
-    name: str = Form(...),
-    file: UploadFile = File(...),
-    metadata: dict = Body({})
+    name: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    metadata: Optional[str] = Form(None)
 ):
-    temp_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(temp_path, "wb") as f:
-        f.write(await file.read())
-    image = cv2.imread(temp_path)
-    if image is None:
-        os.remove(temp_path)
-        raise HTTPException(status_code=400, detail="Invalid image.")
-    embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
-    os.remove(temp_path)
-    if embedding is None:
-        raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
-    update_face_record_helper(face_id, tenant_id, camera_id, name, embedding, metadata)
-    return {"message": "Face updated successfully."}
+    """
+    Update an existing face for a tenant.
+    Validates that the camera exists for the tenant before updating the face.
+    """
+    try:
+        # Parse metadata if provided
+        metadata_dict = json.loads(metadata) if metadata else None
+        metadata_json = json.dumps(metadata_dict) if metadata_dict else None
+        
+        # Process face image if provided
+        embedding = None
+        if file:
+            temp_path = os.path.join(UPLOAD_DIR, file.filename)
+            with open(temp_path, "wb") as f:
+                f.write(await file.read())
+            
+            image = cv2.imread(temp_path)
+            if image is None:
+                os.remove(temp_path)
+                raise HTTPException(status_code=400, detail="Invalid image.")
+                
+            embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
+            os.remove(temp_path)
+            
+            if embedding is None:
+                raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
+            embedding = json.dumps(embedding)
+        
+        # Update face record
+        update_face_record_helper(
+            face_id=face_id,
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            name=name,
+            embedding=embedding,
+            metadata=metadata_json
+        )
+        
+        return {"message": "Face updated successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/tenants/{tenant_id}/faces/{face_id}")
 def remove_face(tenant_id: str, face_id: str):
@@ -594,18 +657,6 @@ async def trigger_event(payload: dict = Body(...)):
 ######################################################################
 # 8) Tenants & Live URL Endpoints
 ######################################################################
-@app.get("/tenants")
-def list_tenants():
-    # List distinct tenants and their camera IDs from the videos table.
-    conn, db_type = get_connection()
-    c = conn.cursor()
-    query = "SELECT DISTINCT tenant_id FROM tenant_config"
-    c.execute(format_query(query, db_type))
-    rows = c.fetchall()
-    conn.close()
-    tenants = [{"tenant_id": row[0]} for row in rows]
-    return {"tenants": tenants}
-
 @app.put("/tenants/{tenant_id}/cameras/{camera_id}/live-url")
 def update_live_url(tenant_id: str, camera_id: str, stream_url: str = Body(...)):
     # Update the live stream URL for a specific tenant and camera.

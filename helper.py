@@ -22,6 +22,23 @@ except ImportError:
 # Database fallback path for SQLite
 DB_PATH = os.getenv("SQLITE_DB_PATH", "violations.db")
 
+def is_using_postgres():
+    """Returns True if PostgreSQL is configured and available, False for SQLite"""
+    database_url = os.getenv("DATABASE_URL")
+    return database_url is not None and psycopg2 is not None
+
+def get_sqlite_connection():
+    """Returns a direct database connection respecting the configured database type"""
+    if is_using_postgres():
+        database_url = os.getenv("DATABASE_URL")
+        try:
+            return psycopg2.connect(database_url)
+        except Exception as e:
+            logging.error("Error connecting to Postgres: %s", e)
+    # Fallback to SQLite
+    import sqlite3
+    return sqlite3.connect(DB_PATH)
+
 def generate_uuid():
     return str(uuid.uuid4())
 
@@ -66,71 +83,6 @@ except Exception:
 
 # ----------------- Required Items ----------------- #
 REQUIRED_ITEMS = {"NO-Mask", "NO-Safety-Vest", "NO-Hardhat"}
-
-# ----------------- Database Initialization ----------------- #
-def init_db():
-    conn, db_type = get_connection()
-    c = conn.cursor()
-    # Tenant configuration table
-    query = """
-    CREATE TABLE IF NOT EXISTS tenant_config (
-        tenant_id TEXT PRIMARY KEY,
-        similarity_threshold REAL,
-        no_mask_threshold INTEGER,
-        no_safety_vest_threshold INTEGER,
-        no_hardhat_threshold INTEGER,
-        external_trigger_url TEXT
-    )
-    """
-    c.execute(format_query(query, db_type))
-    # Videos table – note: using TEXT for video_id (UUID) and adding processing status columns.
-    query = """
-    CREATE TABLE IF NOT EXISTS videos (
-        video_id TEXT PRIMARY KEY,
-        tenant_id TEXT NOT NULL,
-        camera_id TEXT NOT NULL,
-        is_live INTEGER NOT NULL,
-        filename TEXT,
-        stream_url TEXT,
-        size INTEGER DEFAULT 0,
-        fps REAL DEFAULT 0,
-        total_frames INTEGER DEFAULT 0,
-        duration REAL DEFAULT 0,
-        status TEXT DEFAULT 'uploaded',
-        frames_processed INTEGER DEFAULT 0,
-        violations_detected INTEGER DEFAULT 0,
-        UNIQUE(tenant_id, camera_id)
-    )
-    """
-    c.execute(format_query(query, db_type))
-    # Faces table
-    query = """
-    CREATE TABLE IF NOT EXISTS faces (
-        face_id TEXT PRIMARY KEY,
-        tenant_id TEXT NOT NULL,
-        camera_id TEXT NOT NULL,
-        name TEXT,
-        embedding TEXT,
-        metadata TEXT
-    )
-    """
-    c.execute(format_query(query, db_type))
-    # Violations table
-    query = """
-    CREATE TABLE IF NOT EXISTS violations (
-        id TEXT PRIMARY KEY,
-        tenant_id TEXT,
-        camera_id TEXT,
-        violation_timestamp REAL,
-        face_id TEXT,
-        violation_type TEXT,
-        violation_image_path TEXT,
-        details TEXT
-    )
-    """
-    c.execute(format_query(query, db_type))
-    conn.commit()
-    conn.close()
 
 # ----------------- Videos Table Operations ----------------- #
 def check_camera_exists(tenant_id: str, camera_id: str) -> bool:
@@ -289,7 +241,7 @@ def increment_violations_detected(video_id: str):
 def get_tenant_config(tenant_id: str):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url FROM tenant_config WHERE tenant_id = ?"
+    query = "SELECT similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active FROM tenant_config WHERE tenant_id = ?"
     c.execute(format_query(query, db_type), (tenant_id,))
     row = c.fetchone()
     conn.close()
@@ -299,20 +251,21 @@ def get_tenant_config(tenant_id: str):
             "no_mask_threshold": row[1],
             "no_safety_vest_threshold": row[2],
             "no_hardhat_threshold": row[3],
-            "external_trigger_url": row[4]
+            "external_trigger_url": row[4],
+            "is_active": bool(row[5])
         }
     return None
 
-def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url):
+def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active=True):
     existing = get_tenant_config(tenant_id)
     conn, db_type = get_connection()
     c = conn.cursor()
     if existing:
-        query = "UPDATE tenant_config SET similarity_threshold = ?, no_mask_threshold = ?, no_safety_vest_threshold = ?, no_hardhat_threshold = ?, external_trigger_url = ? WHERE tenant_id = ?"
-        c.execute(format_query(query, db_type), (similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, tenant_id))
+        query = "UPDATE tenant_config SET similarity_threshold = ?, no_mask_threshold = ?, no_safety_vest_threshold = ?, no_hardhat_threshold = ?, external_trigger_url = ?, is_active = ? WHERE tenant_id = ?"
+        c.execute(format_query(query, db_type), (similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active, tenant_id))
     else:
-        query = "INSERT INTO tenant_config (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url) VALUES (?, ?, ?, ?, ?, ?)"
-        c.execute(format_query(query, db_type), (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url))
+        query = "INSERT INTO tenant_config (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        c.execute(format_query(query, db_type), (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active))
     conn.commit()
     conn.close()
 
@@ -324,35 +277,187 @@ def delete_tenant_config(tenant_id: str):
     conn.commit()
     conn.close()
 
-# ----------------- Faces Table Operations ----------------- #
-def add_face_record(tenant_id, camera_id, name, embedding, metadata, face_id) -> str:
+def list_tenants():
+    """
+    Lists all tenants with their configurations, active status, and associated cameras.
+    Returns a list of dictionaries containing tenant information.
+    """
     conn, db_type = get_connection()
     c = conn.cursor()
-    
-    # Check if face_id already exists
-    query = "SELECT COUNT(*) FROM faces WHERE face_id = ?"
-    c.execute(format_query(query, db_type), (face_id,))
-    if c.fetchone()[0] > 0:
-        conn.close()
-        raise ValueError(f"Face ID {face_id} already exists")
+    try:
+        # Get all tenants with their configurations
+        query = """
+        SELECT 
+            tc.tenant_id,
+            tc.similarity_threshold,
+            tc.no_mask_threshold,
+            tc.no_safety_vest_threshold,
+            tc.no_hardhat_threshold,
+            tc.external_trigger_url,
+            tc.is_active,
+            COUNT(DISTINCT v.camera_id) as total_cameras,
+            COUNT(DISTINCT f.face_id) as total_faces
+        FROM tenant_config tc
+        LEFT JOIN videos v ON tc.tenant_id = v.tenant_id
+        LEFT JOIN faces f ON tc.tenant_id = f.tenant_id
+        GROUP BY tc.tenant_id
+        """
+        c.execute(format_query(query, db_type))
+        tenants = []
         
-    embedding_json = json.dumps(embedding)
-    metadata_json = json.dumps(metadata)
-    query = "INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata) VALUES (?, ?, ?, ?, ?, ?)"
-    c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding_json, metadata_json))
-    conn.commit()
-    conn.close()
-    return face_id
+        for row in c.fetchall():
+            tenant_id = row[0]
+            # Get cameras for this tenant
+            camera_query = """
+            SELECT 
+                video_id,
+                camera_id,
+                is_live,
+                filename,
+                stream_url,
+                status,
+                size,
+                fps,
+                total_frames,
+                duration,
+                frames_processed,
+                violations_detected
+            FROM videos 
+            WHERE tenant_id = ?
+            """
+            c.execute(format_query(camera_query, db_type), (tenant_id,))
+            cameras = []
+            for cam_row in c.fetchall():
+                cameras.append({
+                    "video_id": cam_row[0],
+                    "camera_id": cam_row[1],
+                    "is_live": bool(cam_row[2]),
+                    "filename": cam_row[3],
+                    "stream_url": cam_row[4],
+                    "status": cam_row[5],
+                    "size": cam_row[6],
+                    "fps": cam_row[7],
+                    "total_frames": cam_row[8],
+                    "duration": cam_row[9],
+                    "frames_processed": cam_row[10],
+                    "violations_detected": cam_row[11]
+                })
+            
+            tenants.append({
+                "tenant_id": tenant_id,
+                "config": {
+                    "similarity_threshold": row[1],
+                    "no_mask_threshold": row[2],
+                    "no_safety_vest_threshold": row[3],
+                    "no_hardhat_threshold": row[4],
+                    "external_trigger_url": row[5],
+                    "is_active": bool(row[6])
+                },
+                "total_cameras": row[7],
+                "total_faces": row[8],
+                "cameras": cameras
+            })
+            
+        return tenants
+    finally:
+        conn.close()
 
-def update_face_record(face_id, tenant_id, camera_id, name, embedding, metadata):
+def update_tenant_status(tenant_id: str, is_active: bool):
     conn, db_type = get_connection()
     c = conn.cursor()
-    embedding_json = json.dumps(embedding)
-    metadata_json = json.dumps(metadata)
-    query = "UPDATE faces SET camera_id = ?, name = ?, embedding = ?, metadata = ? WHERE face_id = ? AND tenant_id = ?"
-    c.execute(format_query(query, db_type), (camera_id, name, embedding_json, metadata_json, face_id, tenant_id))
+    query = "UPDATE tenant_config SET is_active = ? WHERE tenant_id = ?"
+    c.execute(format_query(query, db_type), (is_active, tenant_id))
     conn.commit()
     conn.close()
+
+# ----------------- Faces Table Operations ----------------- #
+def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, embedding: str, metadata: str = None) -> str:
+    """
+    Adds a new face record to the database.
+    Validates that the camera exists for the tenant before adding the face.
+    Returns the face_id if successful.
+    """
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    try:
+        # First verify that the camera exists for this tenant
+        if not check_camera_exists(tenant_id, camera_id):
+            raise ValueError(f"Camera {camera_id} does not exist for tenant {tenant_id}")
+
+        # Check if face_id already exists
+        c.execute(format_query("SELECT face_id FROM faces WHERE face_id = ?", db_type), (face_id,))
+        if c.fetchone():
+            raise ValueError(f"Face ID {face_id} already exists")
+
+        # Insert the new face record
+        query = """
+        INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding, metadata))
+        conn.commit()
+        return face_id
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str = None, embedding: str = None, metadata: str = None) -> bool:
+    """
+    Updates an existing face record in the database.
+    Validates that the camera exists for the tenant before updating the face.
+    Returns True if successful.
+    """
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    try:
+        # First verify that the camera exists for this tenant
+        if not check_camera_exists(tenant_id, camera_id):
+            raise ValueError(f"Camera {camera_id} does not exist for tenant {tenant_id}")
+
+        # Check if face exists
+        c.execute(format_query("SELECT face_id FROM faces WHERE face_id = ?", db_type), (face_id,))
+        if not c.fetchone():
+            raise ValueError(f"Face ID {face_id} does not exist")
+
+        # Build update query dynamically based on provided fields
+        update_fields = []
+        params = []
+        if name is not None:
+            update_fields.append("name = ?")
+            params.append(name)
+        if embedding is not None:
+            update_fields.append("embedding = ?")
+            params.append(embedding)
+        if metadata is not None:
+            update_fields.append("metadata = ?")
+            params.append(metadata)
+        
+        if not update_fields:
+            return True  # No fields to update
+
+        # Add tenant_id and camera_id to params
+        params.extend([tenant_id, camera_id, face_id])
+        
+        query = f"""
+        UPDATE faces 
+        SET {', '.join(update_fields)}
+        WHERE tenant_id = ? AND camera_id = ? AND face_id = ?
+        """
+        
+        c.execute(format_query(query, db_type), params)
+        conn.commit()
+        
+        if c.rowcount == 0:
+            raise ValueError(f"No face found with ID {face_id} for tenant {tenant_id} and camera {camera_id}")
+            
+        return True
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 def delete_face_record(face_id, tenant_id):
     conn, db_type = get_connection()
@@ -460,25 +565,34 @@ def save_annotated_plot(original_bgr_image, boxes, class_names, annotated_image_
     output_dir = os.getenv("OUTPUT_DIR", "./violation_images")
     os.makedirs(output_dir, exist_ok=True)
     timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_filename = f"detected_objects_{timestamp_str}.png"
+    output_filename = f"violation_{timestamp_str}.jpg"
     output_path = os.path.join(output_dir, output_filename)
     
-    # Create a side-by-side image
-    h, w = original_bgr_image.shape[:2]
-    combined_image = np.zeros((h, w*2, 3), dtype=np.uint8)
-    combined_image[:, :w] = original_bgr_image
-    combined_image[:, w:] = cv2.cvtColor(annotated_image_rgb, cv2.COLOR_RGB2BGR)
-    
-    # Add class labels
-    y_offset = 30
-    for class_name, color in class_names.items():
-        cv2.putText(combined_image, class_name, (10, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        y_offset += 30
-    
-    cv2.imwrite(output_path, combined_image)
-    logging.info(f"[INFO] Annotated result saved to: {output_path}")
-    return output_path
+    # Just save the annotated image directly
+    try:
+        # Convert from BGR to RGB if necessary
+        if isinstance(annotated_image_rgb, np.ndarray) and annotated_image_rgb.shape[2] == 3:
+            # Check if image is already in BGR (OpenCV format)
+            if np.array_equal(annotated_image_rgb[:, :, 0], original_bgr_image[:, :, 0]):
+                save_img = annotated_image_rgb
+            else:
+                save_img = cv2.cvtColor(annotated_image_rgb, cv2.COLOR_RGB2BGR)
+        else:
+            save_img = original_bgr_image
+            
+        cv2.imwrite(output_path, save_img)
+        logging.info(f"[INFO] Violation image saved to: {output_path}")
+        return output_path
+    except Exception as e:
+        logging.error(f"[ERROR] Failed to save violation image: {str(e)}")
+        # Fallback to saving the original image
+        try:
+            cv2.imwrite(output_path, original_bgr_image)
+            logging.info(f"[INFO] Fallback: Original image saved to: {output_path}")
+            return output_path
+        except Exception as e2:
+            logging.error(f"[ERROR] Also failed to save original image: {str(e2)}")
+            return None
 
 def extract_face_embedding(image, face_box):
     x1, y1, x2, y2 = face_box
@@ -574,3 +688,85 @@ def find_matching_faces(tenant_id: str, embedding: np.ndarray, similarity_thresh
             matches.append(face_id_maps[tenant_id][i])
             
     return matches
+
+def ensure_tables_exist():
+    """Make sure the required database tables exist"""
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    
+    try:
+        # Create violations table if it doesn't exist
+        if db_type == "postgres":
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS violations (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                violation_timestamp REAL NOT NULL,
+                face_id TEXT NOT NULL,
+                violation_type TEXT NOT NULL,
+                violation_image_path TEXT,
+                details TEXT
+            )
+            """)
+        else:  # sqlite
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS violations (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                violation_timestamp REAL NOT NULL,
+                face_id TEXT NOT NULL,
+                violation_type TEXT NOT NULL,
+                violation_image_path TEXT,
+                details TEXT
+            )
+            """)
+            
+        # Create videos table if it doesn't exist
+        if db_type == "postgres":
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                is_live INTEGER NOT NULL DEFAULT 0,
+                filename TEXT,
+                stream_url TEXT,
+                size INTEGER DEFAULT 0,
+                fps REAL DEFAULT 0,
+                total_frames INTEGER DEFAULT 0,
+                duration REAL DEFAULT 0,
+                status TEXT DEFAULT 'uploaded',
+                frames_processed INTEGER DEFAULT 0,
+                violations_detected INTEGER DEFAULT 0,
+                UNIQUE(tenant_id, camera_id)
+            )
+            """)
+        else:  # sqlite
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                camera_id TEXT NOT NULL,
+                is_live INTEGER NOT NULL DEFAULT 0,
+                filename TEXT,
+                stream_url TEXT,
+                size INTEGER DEFAULT 0,
+                fps REAL DEFAULT 0,
+                total_frames INTEGER DEFAULT 0,
+                duration REAL DEFAULT 0,
+                status TEXT DEFAULT 'uploaded',
+                frames_processed INTEGER DEFAULT 0,
+                violations_detected INTEGER DEFAULT 0,
+                UNIQUE(tenant_id, camera_id)
+            )
+            """)
+            
+        # Create other tables as needed (faces, tenant_config, etc.)
+        
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Error ensuring tables exist: {str(e)}")
+    finally:
+        conn.close()
