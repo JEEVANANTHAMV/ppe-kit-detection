@@ -34,6 +34,39 @@ def format_query(query, db_type):
     return query
 
 def migrate():
+    """Run all migrations in sequence"""
+    try:
+        # Create tables if they don't exist
+        create_tables()
+        
+        # Add s3_url column to videos table if it doesn't exist
+        conn, db_type = get_connection()
+        cursor = conn.cursor()
+        
+        # Check if s3_url column exists
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'videos' AND column_name = 's3_url'
+        """)
+        
+        if not cursor.fetchone():
+            # Add s3_url column
+            cursor.execute("""
+                ALTER TABLE videos 
+                ADD COLUMN s3_url TEXT
+            """)
+            print("Added s3_url column to videos table")
+        
+        conn.commit()
+        conn.close()
+        
+        print("All migrations completed successfully")
+    except Exception as e:
+        print(f"Error during migration: {str(e)}")
+        raise
+
+def create_tables():
     # Database connection already established with environment variables
     conn, db_type = get_connection()
     c = conn.cursor()

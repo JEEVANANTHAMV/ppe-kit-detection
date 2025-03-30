@@ -35,7 +35,11 @@ from helper import (
     format_query,
     list_tenants,
     update_tenant_status,
-    ensure_tables_exist
+    ensure_tables_exist,
+    get_video_record_by_camera,
+    update_video_record_by_camera,
+    delete_video_record_by_camera,
+    get_video_statistics
 )
 from video_processor import start_video_processing
 from pydantic import BaseModel, HttpUrl
@@ -67,6 +71,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Tenant Config Pydantic Model (with separate columns for each violation)
 ######################################################################
 class TenantConfig(BaseModel):
+    tenant_name: str
     similarity_threshold: float
     no_mask_threshold: int
     no_safety_vest_threshold: int
@@ -121,109 +126,102 @@ def get_video_record_by_tenant_camera(tenant_id: str, camera_id: str):
     return None
 
 ######################################################################
-# 1) Video/Stream Registration Endpoint (CHANGED FROM POST TO PUT)
+# 1) Video/Stream Registration Endpoint
 ######################################################################
-@app.put("/videos")
+@app.post("/videos")
 async def upload_video(
     tenant_id: str = Form(...),
     camera_id: str = Form(...),
     is_live: bool = Form(False),
     stream_url: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    s3_url: Optional[str] = Form(None)
 ):
-    """
-    Register or upload a single video/stream for a given tenant & camera.
-    For live feeds (is_live=True): supply stream_url only.
-    For offline videos (is_live=False): supply a video file only.
-    (tenant_id, camera_id) must be unique.
-    """
-    if check_camera_exists(tenant_id, camera_id):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Camera '{camera_id}' already exists for tenant '{tenant_id}'."
-        )
-
-    if is_live:
-        if not stream_url or file is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="For a live feed, provide stream_url only (no file)."
+    try:
+        if is_live:
+            if not stream_url:
+                raise HTTPException(status_code=400, detail="Stream URL is required for live videos")
+            filename = f"live_{camera_id}.mp4"
+        else:
+            if file and s3_url:
+                raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both")
+            if not file and not s3_url:
+                raise HTTPException(status_code=400, detail="Either file or s3_url is required")
+            
+            if s3_url:
+                # Download from S3
+                import boto3
+                s3 = boto3.client('s3')
+                bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                key = s3_url.replace(f"s3://{bucket}/", "")
+                filename = os.path.basename(key)
+                temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                try:
+                    s3.download_file(bucket, key, temp_path)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+            else:
+                filename = file.filename
+                temp_path = os.path.join(UPLOAD_DIR, filename)
+                with open(temp_path, "wb") as f:
+                    f.write(await file.read())
+            
+            # Process video
+            cap = cv2.VideoCapture(temp_path)
+            if not cap.isOpened():
+                os.remove(temp_path)
+                raise HTTPException(status_code=400, detail="Invalid video file")
+            
+            # Get video properties
+            size = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            cap.release()
+            
+            # Move to final location
+            final_path = os.path.join(UPLOAD_DIR, filename)
+            os.rename(temp_path, final_path)
+            
+            # Insert video record
+            video_id = insert_video_record(
+                tenant_id=tenant_id,
+                camera_id=camera_id,
+                is_live=is_live,
+                filename=filename,
+                stream_url=stream_url,
+                s3_url=s3_url
             )
-        video_id = insert_video_record(
-            tenant_id=tenant_id,
-            camera_id=camera_id,
-            is_live=True,
-            stream_url=stream_url
-        )
-        return {
-            "video_id": video_id,
-            "tenant_id": tenant_id,
-            "camera_id": camera_id,
-            "is_live": True,
-            "stream_url": stream_url,
-            "message": "Live stream registered successfully."
-        }
-    else:
-        if file is None or stream_url is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="For an offline video, provide a file only (no stream_url)."
-            )
-        file_location = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_location, "wb") as buffer:
-            buffer.write(await file.read())
-        cap = cv2.VideoCapture(file_location)
-        if not cap.isOpened():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot open video file: {file.filename}"
-            )
-        size_bytes = os.path.getsize(file_location)
-        original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        fps = original_fps
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps > 0 else 0
-        cap.release()
-        video_id = insert_video_record(
-            tenant_id=tenant_id,
-            camera_id=camera_id,
-            is_live=False,
-            filename=file_location,
-            size=size_bytes,
-            fps=fps,
-            total_frames=total_frames,
-            duration=duration
-        )
-        return {
-            "video_id": video_id,
-            "tenant_id": tenant_id,
-            "camera_id": camera_id,
-            "is_live": False,
-            "filename": file.filename,
-            "size": size_bytes,
-            "fps": fps,
-            "duration": duration,
-            "message": "Video uploaded successfully."
-        }
+            
+            return {
+                "video_id": video_id,
+                "message": "Video uploaded successfully",
+                "filename": filename,
+                "s3_url": s3_url
+            }
+            
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 ######################################################################
 # 2) Listing, Status, Stats & DB Status Endpoints
 ######################################################################
 @app.get("/videos")
-def list_videos():
-    # Now fetch all video records directly from the database
-    db_videos = list_video_records()
-    return {"videos": db_videos}
+async def list_videos(tenant_id: str):
+    """List all videos for a specific tenant"""
+    videos = list_video_records(tenant_id)
+    return {"videos": videos}
 
 @app.get("/status")
-def get_status():
-    # For status we now query the DB for each video's status
-    db_videos = list_video_records()
+def get_status(tenant_id: str):
+    db_videos = list_video_records(tenant_id)
     status_list = []
     for video in db_videos:
         status_list.append({
             "video_id": video["video_id"],
-            "tenant_id": video["tenant_id"],
             "camera_id": video["camera_id"],
             "status": video["status"],
             "frames_processed": video.get("frames_processed", 0),
@@ -232,30 +230,12 @@ def get_status():
     return {"videos_status": status_list}
 
 @app.get("/stats")
-def get_stats():
-    total_duration = 0
-    violation_counts = {}
-    processing_videos = []
-    db_videos = list_video_records()
-    
-    for video in db_videos:
-        total_duration += video["duration"] if video["duration"] else 0
-        violation_counts[video["video_id"]] = video.get("violations_detected", 0)
-        
-        if video["status"] == "processing":
-            processing_videos.append({
-                "video_id": video["video_id"],
-                "tenant_id": video["tenant_id"],
-                "camera_id": video["camera_id"],
-                "is_live": video["is_live"],
-                "frames_processed": video.get("frames_processed", 0),
-                "violations_detected": video.get("violations_detected", 0)
-            })
-    
+def get_stats(tenant_id: str):
+    stats = get_video_statistics(tenant_id)
     return {
-        "total_video_duration": total_duration,
-        "violation_counts_per_video": violation_counts,
-        "currently_processing": processing_videos,
+        "total_video_duration": stats["total_duration"],
+        "violation_counts_per_video": stats["violation_counts"],
+        "currently_processing": stats["processing_videos"],
         "active_processes": len(active_processes)
     }
 
@@ -387,42 +367,44 @@ def get_config(tenant_id: str):
     return config
 
 @app.post("/tenants/{tenant_id}/config")
-def create_config(tenant_id: str, config: TenantConfig):
-    existing = get_tenant_config(tenant_id)
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Configuration already exists. Use PUT /tenants/{tenant_id}/config/update to update."
+async def add_tenant_config(
+    tenant_id: str,
+    config: TenantConfig
+):
+    try:
+        add_or_update_tenant_config(
+            tenant_id=tenant_id,
+            tenant_name=config.tenant_name,
+            similarity_threshold=config.similarity_threshold,
+            no_mask_threshold=config.no_mask_threshold,
+            no_safety_vest_threshold=config.no_safety_vest_threshold,
+            no_hardhat_threshold=config.no_hardhat_threshold,
+            external_trigger_url=str(config.external_trigger_url) if config.external_trigger_url else None,
+            is_active=config.is_active
         )
-    add_or_update_tenant_config(
-        tenant_id,
-        config.similarity_threshold,
-        config.no_mask_threshold,
-        config.no_safety_vest_threshold,
-        config.no_hardhat_threshold,
-        str(config.external_trigger_url),
-        config.is_active
-    )
-    return {"message": "Configuration created successfully."}
+        return {"message": "Tenant configuration added successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/tenants/{tenant_id}/config/update")
-def update_config(tenant_id: str, config: TenantConfig):
-    existing = get_tenant_config(tenant_id)
-    if not existing:
-        raise HTTPException(
-            status_code=404,
-            detail="Configuration not found. Use POST /tenants/{tenant_id}/config to create."
+@app.post("/tenants/{tenant_id}/config/update")
+async def update_tenant_config(
+    tenant_id: str,
+    config: TenantConfig
+):
+    try:
+        add_or_update_tenant_config(
+            tenant_id=tenant_id,
+            tenant_name=config.tenant_name,
+            similarity_threshold=config.similarity_threshold,
+            no_mask_threshold=config.no_mask_threshold,
+            no_safety_vest_threshold=config.no_safety_vest_threshold,
+            no_hardhat_threshold=config.no_hardhat_threshold,
+            external_trigger_url=str(config.external_trigger_url) if config.external_trigger_url else None,
+            is_active=config.is_active
         )
-    add_or_update_tenant_config(
-        tenant_id,
-        config.similarity_threshold,
-        config.no_mask_threshold,
-        config.no_safety_vest_threshold,
-        config.no_hardhat_threshold,
-        str(config.external_trigger_url),
-        config.is_active
-    )
-    return {"message": "Configuration updated successfully."}
+        return {"message": "Tenant configuration updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/tenants/{tenant_id}/status")
 def update_tenant_status_endpoint(tenant_id: str, status: TenantStatusUpdate):
@@ -458,48 +440,74 @@ async def add_face(
     tenant_id: str,
     camera_id: str = Form(...),
     name: str = Form(...),
-    face_id: str = Form(...),  # Required face_id from user
-    file: UploadFile = File(...),
+    face_id: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    s3_url: Optional[str] = Form(None),
     metadata: Optional[str] = Form(None)
 ):
-    """
-    Add a new face for a tenant.
-    Validates that the camera exists for the tenant before adding the face.
-    Requires face_id to be provided by the user.
-    """
     try:
         # Parse metadata if provided
         metadata_dict = json.loads(metadata) if metadata else None
         metadata_json = json.dumps(metadata_dict) if metadata_dict else None
 
-        # Save and process the face image
-        temp_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(temp_path, "wb") as f:
-            f.write(await file.read())
+        # Handle image input (either file or s3_url)
+        if file and s3_url:
+            raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both.")
+        if not file and not s3_url:
+            raise HTTPException(status_code=400, detail="Either file or s3_url is required.")
+
+        # Process image
+        image_path = None
+        if s3_url:
+            # Download from S3
+            import boto3
+            s3 = boto3.client('s3')
+            bucket = os.getenv('S3_BUCKET', 'your-bucket')
+            key = s3_url.replace(f"s3://{bucket}/", "")
+            image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
+            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+            try:
+                s3.download_file(bucket, key, image_path)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+        else:
+            # Save uploaded file
+            image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
+            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+            with open(image_path, "wb") as f:
+                f.write(await file.read())
         
-        image = cv2.imread(temp_path)
+        # Process image
+        image = cv2.imread(image_path)
         if image is None:
-            os.remove(temp_path)
+            os.remove(image_path)
             raise HTTPException(status_code=400, detail="Invalid image.")
             
         # Extract face embedding
         embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
-        os.remove(temp_path)
         
         if embedding is None:
+            os.remove(image_path)
             raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
         
         # Add face record
         face_id = add_face_record(
             tenant_id=tenant_id,
             camera_id=camera_id,
-            face_id=face_id,  # Use provided face_id
+            face_id=face_id,
             name=name,
             embedding=json.dumps(embedding),
-            metadata=metadata_json
+            metadata=metadata_json,
+            image_path=image_path,
+            s3_url=s3_url
         )
         
-        return {"face_id": face_id, "message": "Face added successfully"}
+        return {
+            "face_id": face_id,
+            "message": "Face added successfully",
+            "image_path": image_path,
+            "s3_url": s3_url
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -517,12 +525,9 @@ async def update_face(
     camera_id: str = Form(...),
     name: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    s3_url: Optional[str] = Form(None),
     metadata: Optional[str] = Form(None)
 ):
-    """
-    Update an existing face for a tenant.
-    Validates that the camera exists for the tenant before updating the face.
-    """
     try:
         # Parse metadata if provided
         metadata_dict = json.loads(metadata) if metadata else None
@@ -530,20 +535,39 @@ async def update_face(
         
         # Process face image if provided
         embedding = None
-        if file:
-            temp_path = os.path.join(UPLOAD_DIR, file.filename)
-            with open(temp_path, "wb") as f:
-                f.write(await file.read())
+        image_path = None
+        if file or s3_url:
+            if file and s3_url:
+                raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both.")
+
+            if s3_url:
+                # Download from S3
+                import boto3
+                s3 = boto3.client('s3')
+                bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                key = s3_url.replace(f"s3://{bucket}/", "")
+                image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
+                os.makedirs(os.path.dirname(image_path), exist_ok=True)
+                try:
+                    s3.download_file(bucket, key, image_path)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+            else:
+                # Save uploaded file
+                image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
+                os.makedirs(os.path.dirname(image_path), exist_ok=True)
+                with open(image_path, "wb") as f:
+                    f.write(await file.read())
             
-            image = cv2.imread(temp_path)
+            image = cv2.imread(image_path)
             if image is None:
-                os.remove(temp_path)
+                os.remove(image_path)
                 raise HTTPException(status_code=400, detail="Invalid image.")
                 
             embedding = extract_face_embedding(image, (0, 0, image.shape[1], image.shape[0]))
-            os.remove(temp_path)
             
             if embedding is None:
+                os.remove(image_path)
                 raise HTTPException(status_code=400, detail="No face detected or could not extract embedding.")
             embedding = json.dumps(embedding)
         
@@ -554,10 +578,16 @@ async def update_face(
             camera_id=camera_id,
             name=name,
             embedding=embedding,
-            metadata=metadata_json
+            metadata=metadata_json,
+            image_path=image_path,
+            s3_url=s3_url
         )
         
-        return {"message": "Face updated successfully"}
+        return {
+            "message": "Face updated successfully",
+            "image_path": image_path,
+            "s3_url": s3_url
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -571,71 +601,90 @@ def remove_face(tenant_id: str, face_id: str):
 ######################################################################
 # 6) Video Deletion and Update Endpoints
 ######################################################################
-@app.delete("/videos/{video_id}")
-def delete_video(video_id: str):
-    success = delete_video_record(video_id)
+@app.delete("/videos/{camera_id}")
+def delete_video(camera_id: str, tenant_id: str):
+    success = delete_video_record_by_camera(tenant_id, camera_id)
     if not success:
         raise HTTPException(status_code=404, detail="Video not found.")
-    return {"message": f"Video {video_id} deleted successfully."}
+    return {"message": f"Video for camera {camera_id} deleted successfully."}
 
-@app.put("/videos/{video_id}")
+@app.put("/videos/{camera_id}")
 async def update_video(
-    video_id: str,
-    tenant_id: Optional[str] = Form(None),
-    camera_id: Optional[str] = Form(None),
+    camera_id: str,
+    tenant_id: str = Form(...),
     is_live: Optional[bool] = Form(None),
     stream_url: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    s3_url: Optional[str] = Form(None)
 ):
-    video_record = get_video_record(video_id)
-    if not video_record:
-        raise HTTPException(status_code=404, detail="Video not found.")
+    try:
+        # Get existing video record
+        video = get_video_record_by_camera(tenant_id, camera_id)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
         
-    # Check if trying to upload file for live stream
-    if file is not None and (video_record["is_live"] or (is_live is not None and is_live)):
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot upload file for live stream. Use stream_url instead."
+        # Handle file upload if provided
+        filename = None
+        if file or s3_url:
+            if file and s3_url:
+                raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both")
+            
+            if s3_url:
+                # Download from S3
+                import boto3
+                s3 = boto3.client('s3')
+                bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                key = s3_url.replace(f"s3://{bucket}/", "")
+                filename = os.path.basename(key)
+                temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                try:
+                    s3.download_file(bucket, key, temp_path)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+            else:
+                filename = file.filename
+                temp_path = os.path.join(UPLOAD_DIR, filename)
+                with open(temp_path, "wb") as f:
+                    f.write(await file.read())
+            
+            # Process video
+            cap = cv2.VideoCapture(temp_path)
+            if not cap.isOpened():
+                os.remove(temp_path)
+                raise HTTPException(status_code=400, detail="Invalid video file")
+            
+            cap.release()
+            
+            # Move to final location
+            final_path = os.path.join(UPLOAD_DIR, filename)
+            os.rename(temp_path, final_path)
+        
+        # Update video record
+        success = update_video_record(
+            video_id=video["video_id"],
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            is_live=is_live,
+            stream_url=stream_url,
+            status=status,
+            filename=filename,
+            s3_url=s3_url
         )
         
-    update_fields = {}
-    if tenant_id is not None:
-        update_fields["tenant_id"] = tenant_id
-    if camera_id is not None:
-        update_fields["camera_id"] = camera_id
-    if is_live is not None:
-        update_fields["is_live"] = 1 if is_live else 0
-    if stream_url is not None:
-        update_fields["stream_url"] = stream_url
-    if status is not None:
-        update_fields["status"] = status
-
-    if file and not video_record["is_live"]:
-        file_location = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_location, "wb") as buffer:
-            buffer.write(await file.read())
-        cap = cv2.VideoCapture(file_location)
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail=f"Cannot open video file: {file.filename}")
-        try:
-            size_bytes = os.path.getsize(file_location)
-            original_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            fps = original_fps
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = total_frames / fps if fps > 0 else 0
-            update_fields["filename"] = file_location
-            update_fields["size"] = size_bytes
-            update_fields["fps"] = fps
-            update_fields["total_frames"] = total_frames
-            update_fields["duration"] = duration
-        finally:
-            cap.release()
-
-    if not update_fields:
-        raise HTTPException(status_code=400, detail="No fields provided to update.")
-    update_video_record(video_id, update_fields)
-    return {"message": f"Video {video_id} updated successfully."}
+        if not success:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        return {
+            "message": "Video updated successfully",
+            "filename": filename,
+            "s3_url": s3_url
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 ######################################################################
 # 7) External Trigger Testing Endpoint (IMPROVED ERROR HANDLING)

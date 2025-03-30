@@ -12,6 +12,7 @@ from ultralytics import YOLO
 import logging
 import uuid
 import faiss
+from typing import List, Dict, Optional
 
 # Try to import psycopg2 for Postgres support
 try:
@@ -94,73 +95,110 @@ def check_camera_exists(tenant_id: str, camera_id: str) -> bool:
     conn.close()
     return count > 0
 
-def insert_video_record(
-    tenant_id: str,
-    camera_id: str,
-    is_live: bool,
-    filename: str = None,
-    stream_url: str = None,
-    size: int = 0,
-    fps: float = 0,
-    total_frames: int = 0,
-    duration: float = 0
-) -> str:
+def insert_video_record(tenant_id: str, camera_id: str, is_live: bool, filename: str, stream_url: Optional[str] = None, s3_url: Optional[str] = None) -> str:
+    """Insert a new video record into the database"""
     conn, db_type = get_connection()
-    c = conn.cursor()
-    video_id = generate_uuid()
-    status = "registered" if is_live else "uploaded"
-    query = """
-    INSERT INTO videos (video_id, tenant_id, camera_id, is_live, filename, stream_url, size, fps, total_frames, duration, status, frames_processed, violations_detected)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
-    """
-    c.execute(format_query(query, db_type), (
-        video_id,
-        tenant_id,
-        camera_id,
-        1 if is_live else 0,
-        filename,
-        stream_url,
-        size,
-        fps,
-        total_frames,
-        duration,
-        status
-    ))
+    cursor = conn.cursor()
+    
+    # Check if camera exists for this tenant
+    cursor.execute("""
+        SELECT camera_id FROM cameras 
+        WHERE tenant_id = %s AND camera_id = %s
+    """, (tenant_id, camera_id))
+    
+    if not cursor.fetchone():
+        raise ValueError(f"Camera {camera_id} not found for tenant {tenant_id}")
+    
+    # Check if video already exists for this camera
+    cursor.execute("""
+        SELECT video_id FROM videos 
+        WHERE tenant_id = %s AND camera_id = %s
+    """, (tenant_id, camera_id))
+    
+    existing = cursor.fetchone()
+    if existing:
+        raise ValueError(f"Video already exists for camera {camera_id}")
+    
+    # Insert new video record
+    cursor.execute("""
+        INSERT INTO videos (
+            tenant_id, camera_id, is_live, filename, 
+            stream_url, s3_url, status, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        RETURNING video_id
+    """, (tenant_id, camera_id, is_live, filename, stream_url, s3_url, "pending"))
+    
+    video_id = cursor.fetchone()[0]
     conn.commit()
     conn.close()
     return video_id
 
-def list_video_records():
+def list_video_records(tenant_id: str) -> List[Dict]:
+    """List all video records for a tenant"""
     conn, db_type = get_connection()
-    c = conn.cursor()
-    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected FROM videos"
-    c.execute(format_query(query, db_type))
-    rows = c.fetchall()
-    conn.close()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            video_id, camera_id, is_live, filename, 
+            stream_url, s3_url, status
+        FROM videos 
+        WHERE tenant_id = %s
+    """, (tenant_id,))
+    
     videos = []
-    for row in rows:
+    for row in cursor.fetchall():
         videos.append({
             "video_id": row[0],
-            "tenant_id": row[1],
-            "camera_id": row[2],
-            "is_live": bool(row[3]),
-            "filename": row[4],
-            "stream_url": row[5],
-            "status": row[6],
-            "size": row[7],
-            "fps": row[8],
-            "total_frames": row[9],
-            "duration": row[10],
-            "frames_processed": row[11],
-            "violations_detected": row[12]
+            "camera_id": row[1],
+            "is_live": row[2],
+            "filename": row[3],
+            "stream_url": row[4],
+            "s3_url": row[5],
+            "status": row[6]
         })
+    
+    conn.close()
     return videos
 
-def get_video_record(video_id: str):
+def get_video_record(video_id: str) -> Optional[Dict]:
+    """Get a specific video record by video_id"""
+    conn, db_type = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            video_id, tenant_id, camera_id, is_live, 
+            filename, stream_url, s3_url, status, 
+            created_at, updated_at
+        FROM videos 
+        WHERE video_id = %s
+    """, (video_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    return {
+        "video_id": row[0],
+        "tenant_id": row[1],
+        "camera_id": row[2],
+        "is_live": row[3],
+        "filename": row[4],
+        "stream_url": row[5],
+        "s3_url": row[6],
+        "status": row[7],
+        "created_at": row[8].isoformat() if row[8] else None,
+        "updated_at": row[9].isoformat() if row[9] else None
+    }
+
+def get_video_record_by_camera(tenant_id: str, camera_id: str):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected FROM videos WHERE video_id = ?"
-    c.execute(format_query(query, db_type), (video_id,))
+    query = "SELECT video_id, tenant_id, camera_id, is_live, filename, stream_url, status, size, fps, total_frames, duration, frames_processed, violations_detected FROM videos WHERE tenant_id = ? AND camera_id = ?"
+    c.execute(format_query(query, db_type), (tenant_id, camera_id))
     row = c.fetchone()
     conn.close()
     if row:
@@ -181,17 +219,56 @@ def get_video_record(video_id: str):
         }
     return None
 
-def update_video_record(video_id: str, fields: dict) -> bool:
-    if not fields:
-        return False
+def update_video_record(video_id: str, tenant_id: str, camera_id: str, is_live: Optional[bool] = None, 
+                       stream_url: Optional[str] = None, status: Optional[str] = None, 
+                       filename: Optional[str] = None, s3_url: Optional[str] = None) -> bool:
+    """Update an existing video record"""
     conn, db_type = get_connection()
-    c = conn.cursor()
-    set_clause = ", ".join([f"{k} = ?" for k in fields.keys()])
-    values = list(fields.values())
-    values.append(video_id)
-    query = f"UPDATE videos SET {set_clause} WHERE video_id = ?"
-    c.execute(format_query(query, db_type), tuple(values))
-    conn.commit()
+    cursor = conn.cursor()
+    
+    # Check if video exists
+    cursor.execute("""
+        SELECT video_id FROM videos 
+        WHERE video_id = %s AND tenant_id = %s AND camera_id = %s
+    """, (video_id, tenant_id, camera_id))
+    
+    if not cursor.fetchone():
+        conn.close()
+        return False
+    
+    # Build update query dynamically
+    update_fields = []
+    update_values = []
+    
+    if is_live is not None:
+        update_fields.append("is_live = %s")
+        update_values.append(is_live)
+    if stream_url is not None:
+        update_fields.append("stream_url = %s")
+        update_values.append(stream_url)
+    if status is not None:
+        update_fields.append("status = %s")
+        update_values.append(status)
+    if filename is not None:
+        update_fields.append("filename = %s")
+        update_values.append(filename)
+    if s3_url is not None:
+        update_fields.append("s3_url = %s")
+        update_values.append(s3_url)
+    
+    if update_fields:
+        update_fields.append("updated_at = NOW()")
+        update_values.extend([video_id, tenant_id, camera_id])
+        
+        query = f"""
+            UPDATE videos 
+            SET {", ".join(update_fields)}
+            WHERE video_id = %s AND tenant_id = %s AND camera_id = %s
+        """
+        
+        cursor.execute(query, update_values)
+        conn.commit()
+    
     conn.close()
     return True
 
@@ -207,6 +284,24 @@ def delete_video_record(video_id: str) -> bool:
     filename = row[0]
     query = "DELETE FROM videos WHERE video_id = ?"
     c.execute(format_query(query, db_type), (video_id,))
+    conn.commit()
+    conn.close()
+    if filename and os.path.exists(filename):
+        os.remove(filename)
+    return True
+
+def delete_video_record_by_camera(tenant_id: str, camera_id: str) -> bool:
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT filename FROM videos WHERE tenant_id = ? AND camera_id = ?"
+    c.execute(format_query(query, db_type), (tenant_id, camera_id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+    filename = row[0]
+    query = "DELETE FROM videos WHERE tenant_id = ? AND camera_id = ?"
+    c.execute(format_query(query, db_type), (tenant_id, camera_id))
     conn.commit()
     conn.close()
     if filename and os.path.exists(filename):
@@ -237,35 +332,49 @@ def increment_violations_detected(video_id: str):
     conn.commit()
     conn.close()
 
+def update_video_record_by_camera(tenant_id: str, camera_id: str, fields: dict) -> bool:
+    if not fields:
+        return False
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    set_clause = ", ".join([f"{k} = ?" for k in fields.keys()])
+    values = list(fields.values())
+    values.extend([tenant_id, camera_id])
+    query = f"UPDATE videos SET {set_clause} WHERE tenant_id = ? AND camera_id = ?"
+    c.execute(format_query(query, db_type), tuple(values))
+    conn.commit()
+    conn.close()
+
 # ----------------- Tenant Config Operations ----------------- #
 def get_tenant_config(tenant_id: str):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active FROM tenant_config WHERE tenant_id = ?"
+    query = "SELECT tenant_name, similarity_threshold, mask_threshold_minutes, vest_threshold_minutes, hardhat_threshold_minutes, external_trigger_url, is_active FROM tenant_config WHERE tenant_id = ?"
     c.execute(format_query(query, db_type), (tenant_id,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
-            "similarity_threshold": row[0],
-            "no_mask_threshold": row[1],
-            "no_safety_vest_threshold": row[2],
-            "no_hardhat_threshold": row[3],
-            "external_trigger_url": row[4],
-            "is_active": bool(row[5])
+            "tenant_name": row[0],
+            "similarity_threshold": row[1],
+            "no_mask_threshold": row[2],
+            "no_safety_vest_threshold": row[3],
+            "no_hardhat_threshold": row[4],
+            "external_trigger_url": row[5],
+            "is_active": bool(row[6])
         }
     return None
 
-def add_or_update_tenant_config(tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active=True):
+def add_or_update_tenant_config(tenant_id, tenant_name, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active=True):
     existing = get_tenant_config(tenant_id)
     conn, db_type = get_connection()
     c = conn.cursor()
     if existing:
-        query = "UPDATE tenant_config SET similarity_threshold = ?, no_mask_threshold = ?, no_safety_vest_threshold = ?, no_hardhat_threshold = ?, external_trigger_url = ?, is_active = ? WHERE tenant_id = ?"
-        c.execute(format_query(query, db_type), (similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active, tenant_id))
+        query = "UPDATE tenant_config SET tenant_name = ?, similarity_threshold = ?, mask_threshold_minutes = ?, vest_threshold_minutes = ?, hardhat_threshold_minutes = ?, external_trigger_url = ?, is_active = ? WHERE tenant_id = ?"
+        c.execute(format_query(query, db_type), (tenant_name, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active, tenant_id))
     else:
-        query = "INSERT INTO tenant_config (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        c.execute(format_query(query, db_type), (tenant_id, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active))
+        query = "INSERT INTO tenant_config (tenant_id, tenant_name, similarity_threshold, mask_threshold_minutes, vest_threshold_minutes, hardhat_threshold_minutes, external_trigger_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        c.execute(format_query(query, db_type), (tenant_id, tenant_name, similarity_threshold, no_mask_threshold, no_safety_vest_threshold, no_hardhat_threshold, external_trigger_url, is_active))
     conn.commit()
     conn.close()
 
@@ -290,9 +399,9 @@ def list_tenants():
         SELECT 
             tc.tenant_id,
             tc.similarity_threshold,
-            tc.no_mask_threshold,
-            tc.no_safety_vest_threshold,
-            tc.no_hardhat_threshold,
+            tc.mask_threshold_minutes,
+            tc.vest_threshold_minutes,
+            tc.hardhat_threshold_minutes,
             tc.external_trigger_url,
             tc.is_active,
             COUNT(DISTINCT v.camera_id) as total_cameras,
@@ -371,7 +480,7 @@ def update_tenant_status(tenant_id: str, is_active: bool):
     conn.close()
 
 # ----------------- Faces Table Operations ----------------- #
-def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, embedding: str, metadata: str = None) -> str:
+def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, embedding: str, metadata: str = None, image_path: str = None, s3_url: str = None) -> str:
     """
     Adds a new face record to the database.
     Validates that the camera exists for the tenant before adding the face.
@@ -391,10 +500,10 @@ def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, emb
 
         # Insert the new face record
         query = """
-        INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """
-        c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding, metadata))
+        c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url))
         conn.commit()
         return face_id
     except Exception as e:
@@ -403,7 +512,7 @@ def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, emb
     finally:
         conn.close()
 
-def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str = None, embedding: str = None, metadata: str = None) -> bool:
+def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str = None, embedding: str = None, metadata: str = None, image_path: str = None, s3_url: str = None) -> bool:
     """
     Updates an existing face record in the database.
     Validates that the camera exists for the tenant before updating the face.
@@ -433,6 +542,12 @@ def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str =
         if metadata is not None:
             update_fields.append("metadata = ?")
             params.append(metadata)
+        if image_path is not None:
+            update_fields.append("image_path = ?")
+            params.append(image_path)
+        if s3_url is not None:
+            update_fields.append("s3_url = ?")
+            params.append(s3_url)
         
         if not update_fields:
             return True  # No fields to update
@@ -470,7 +585,7 @@ def delete_face_record(face_id, tenant_id):
 def list_face_records(tenant_id):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT face_id, camera_id, name, embedding, metadata FROM faces WHERE tenant_id = ?"
+    query = "SELECT face_id, camera_id, name, embedding, metadata, image_path, s3_url FROM faces WHERE tenant_id = ?"
     c.execute(format_query(query, db_type), (tenant_id,))
     rows = c.fetchall()
     conn.close()
@@ -481,9 +596,31 @@ def list_face_records(tenant_id):
             "camera_id": row[1],
             "name": row[2],
             "embedding": json.loads(row[3]),
-            "metadata": json.loads(row[4])
+            "metadata": json.loads(row[4]) if row[4] else None,
+            "image_path": row[5],
+            "s3_url": row[6]
         })
     return faces
+
+def get_face_record(face_id: str):
+    conn, db_type = get_connection()
+    c = conn.cursor()
+    query = "SELECT face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url FROM faces WHERE face_id = ?"
+    c.execute(format_query(query, db_type), (face_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "face_id": row[0],
+            "tenant_id": row[1],
+            "camera_id": row[2],
+            "name": row[3],
+            "embedding": json.loads(row[4]),
+            "metadata": json.loads(row[5]) if row[5] else None,
+            "image_path": row[6],
+            "s3_url": row[7]
+        }
+    return None
 
 # ----------------- Violations Table Operations ----------------- #
 def save_violation_to_db(
@@ -770,3 +907,51 @@ def ensure_tables_exist():
         logging.error(f"Error ensuring tables exist: {str(e)}")
     finally:
         conn.close()
+
+def get_video_statistics(tenant_id: str) -> Dict:
+    """Get video statistics for a specific tenant"""
+    conn, db_type = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            video_id,
+            tenant_id,
+            camera_id,
+            is_live,
+            duration,
+            status,
+            frames_processed,
+            violations_detected
+        FROM videos 
+        WHERE tenant_id = %s
+    """, (tenant_id,))
+    
+    total_duration = 0
+    violation_counts = {}
+    processing_videos = []
+    
+    for row in cursor.fetchall():
+        video_id = row[0]
+        duration = row[4] or 0
+        status = row[5]
+        
+        total_duration += duration
+        violation_counts[video_id] = row[7] or 0
+        
+        if status == "processing":
+            processing_videos.append({
+                "video_id": video_id,
+                "tenant_id": row[1],
+                "camera_id": row[2],
+                "is_live": bool(row[3]),
+                "frames_processed": row[6] or 0,
+                "violations_detected": row[7] or 0
+            })
+    
+    conn.close()
+    return {
+        "total_duration": total_duration,
+        "violation_counts": violation_counts,
+        "processing_videos": processing_videos
+    }

@@ -22,7 +22,7 @@ def setup_database():
         # Check if we should use PostgreSQL
         database_url = os.getenv("DATABASE_URL")
         using_postgres = False
-        
+        print(database_url)
         if database_url:
             try:
                 import psycopg2
@@ -78,25 +78,31 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS faces (
             face_id TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
-            face_name TEXT,
-            face_role TEXT,
-            embedding TEXT,
-            face_image_path TEXT
-        )
+            camera_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            metadata TEXT,
+            image_path TEXT,
+            s3_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         """)
         
         # Create tenant_config table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS tenant_config (
             tenant_id TEXT PRIMARY KEY,
+            tenant_name TEXT NOT NULL,
             similarity_threshold REAL DEFAULT 0.5,
             mask_threshold_minutes INTEGER DEFAULT 5,
             vest_threshold_minutes INTEGER DEFAULT 5,
             hardhat_threshold_minutes INTEGER DEFAULT 5,
             external_trigger_url TEXT,
-            is_active INTEGER DEFAULT 1
-        )
-        """)
+            is_active BOOLEAN DEFAULT true  -- Correct boolean default
+        );  -- Closing parenthesis was missing
+    """)
+
+
         
         conn.commit()
         logging.info("Database setup completed successfully")

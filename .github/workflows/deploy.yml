@@ -1,10 +1,5 @@
 name: Deploy to Azure Container Instances (ACI)
 
-on:
-  push:
-    branches:
-      - main
-
 permissions:
   contents: read
 
