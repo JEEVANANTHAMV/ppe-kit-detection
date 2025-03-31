@@ -95,19 +95,21 @@ def check_camera_exists(tenant_id: str, camera_id: str) -> bool:
     conn.close()
     return count > 0
 
-def insert_video_record(tenant_id: str, camera_id: str, is_live: bool, filename: str, stream_url: Optional[str] = None, s3_url: Optional[str] = None) -> str:
+def insert_video_record(
+    tenant_id: str,
+    camera_id: str,
+    is_live: bool,
+    filename: str,
+    stream_url: Optional[str] = None,
+    s3_url: Optional[str] = None,
+    size: int = 0,
+    fps: float = 0,
+    total_frames: int = 0,
+    duration: float = 0
+) -> str:
     """Insert a new video record into the database"""
     conn, db_type = get_connection()
     cursor = conn.cursor()
-    
-    # Check if camera exists for this tenant
-    cursor.execute("""
-        SELECT camera_id FROM cameras 
-        WHERE tenant_id = %s AND camera_id = %s
-    """, (tenant_id, camera_id))
-    
-    if not cursor.fetchone():
-        raise ValueError(f"Camera {camera_id} not found for tenant {tenant_id}")
     
     # Check if video already exists for this camera
     cursor.execute("""
@@ -120,15 +122,20 @@ def insert_video_record(tenant_id: str, camera_id: str, is_live: bool, filename:
         raise ValueError(f"Video already exists for camera {camera_id}")
     
     # Insert new video record
+    video_id = generate_uuid()
     cursor.execute("""
         INSERT INTO videos (
-            tenant_id, camera_id, is_live, filename, 
-            stream_url, s3_url, status, created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            video_id, tenant_id, camera_id, is_live, filename, 
+            stream_url, s3_url, status, size, fps, total_frames, 
+            duration, frames_processed, violations_detected
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 0)
         RETURNING video_id
-    """, (tenant_id, camera_id, is_live, filename, stream_url, s3_url, "pending"))
-    
-    video_id = cursor.fetchone()[0]
+    """, (
+        video_id, tenant_id, camera_id, is_live, filename,
+        stream_url, s3_url, "uploaded", size, fps, total_frames,
+        duration
+    ))
+
     conn.commit()
     conn.close()
     return video_id
@@ -170,7 +177,8 @@ def get_video_record(video_id: str) -> Optional[Dict]:
         SELECT 
             video_id, tenant_id, camera_id, is_live, 
             filename, stream_url, s3_url, status, 
-            created_at, updated_at
+            size, fps, total_frames, duration, 
+            frames_processed, violations_detected
         FROM videos 
         WHERE video_id = %s
     """, (video_id,))
@@ -190,8 +198,12 @@ def get_video_record(video_id: str) -> Optional[Dict]:
         "stream_url": row[5],
         "s3_url": row[6],
         "status": row[7],
-        "created_at": row[8].isoformat() if row[8] else None,
-        "updated_at": row[9].isoformat() if row[9] else None
+        "size": row[8],
+        "fps": row[9],
+        "total_frames": row[10],
+        "duration": row[11],
+        "frames_processed": row[12],
+        "violations_detected": row[13]
     }
 
 def get_video_record_by_camera(tenant_id: str, camera_id: str):
@@ -257,7 +269,6 @@ def update_video_record(video_id: str, tenant_id: str, camera_id: str, is_live: 
         update_values.append(s3_url)
     
     if update_fields:
-        update_fields.append("updated_at = NOW()")
         update_values.extend([video_id, tenant_id, camera_id])
         
         query = f"""

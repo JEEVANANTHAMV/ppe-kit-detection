@@ -15,13 +15,11 @@ from fastapi import (
 )
 import logging
 from helper import (
-    check_camera_exists,
     insert_video_record,
     get_tenant_config,
     list_video_records,
     get_video_record,
     update_video_record,
-    delete_video_record,
     list_face_records,
     extract_face_embedding,
     trigger_external_event,
@@ -37,7 +35,6 @@ from helper import (
     update_tenant_status,
     ensure_tables_exist,
     get_video_record_by_camera,
-    update_video_record_by_camera,
     delete_video_record_by_camera,
     get_video_statistics
 )
@@ -142,6 +139,11 @@ async def upload_video(
             if not stream_url:
                 raise HTTPException(status_code=400, detail="Stream URL is required for live videos")
             filename = f"live_{camera_id}.mp4"
+            # For live videos, we don't have size/fps/duration yet
+            size = 0
+            fps = 0
+            total_frames = 0
+            duration = 0
         else:
             if file and s3_url:
                 raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both")
@@ -173,7 +175,7 @@ async def upload_video(
                 raise HTTPException(status_code=400, detail="Invalid video file")
             
             # Get video properties
-            size = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            size = int(os.path.getsize(temp_path))  # Get file size in bytes
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = total_frames / fps if fps > 0 else 0
@@ -183,23 +185,31 @@ async def upload_video(
             # Move to final location
             final_path = os.path.join(UPLOAD_DIR, filename)
             os.rename(temp_path, final_path)
-            
-            # Insert video record
-            video_id = insert_video_record(
-                tenant_id=tenant_id,
-                camera_id=camera_id,
-                is_live=is_live,
-                filename=filename,
-                stream_url=stream_url,
-                s3_url=s3_url
-            )
-            
-            return {
-                "video_id": video_id,
-                "message": "Video uploaded successfully",
-                "filename": filename,
-                "s3_url": s3_url
-            }
+        
+        # Insert video record with all fields
+        video_id = insert_video_record(
+            tenant_id=tenant_id,
+            camera_id=camera_id,
+            is_live=is_live,
+            filename=final_path,
+            stream_url=stream_url,
+            s3_url=s3_url,
+            size=size,
+            fps=fps,
+            total_frames=total_frames,
+            duration=duration
+        )
+        
+        return {
+            "video_id": video_id,
+            "message": "Video uploaded successfully",
+            "filename": filename,
+            "s3_url": s3_url,
+            "size": size,
+            "fps": fps,
+            "total_frames": total_frames,
+            "duration": duration
+        }
             
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -288,9 +298,9 @@ async def monitor_video_process(video_id: str, process, status_queue):
         if video_id in active_processes:
             del active_processes[video_id]
 
-@app.post("/process")
-async def process_videos(background_tasks: BackgroundTasks):
-    videos = list_video_records()
+@app.post("/process/{tenant_id}")
+async def process_videos(tenant_id: str, background_tasks: BackgroundTasks):
+    videos = list_video_records(tenant_id)
     vids_to_run = []
     skipped_videos = []
     
@@ -299,7 +309,7 @@ async def process_videos(background_tasks: BackgroundTasks):
         if video["status"] not in ("uploaded", "registered"):
             continue
             
-        config = get_tenant_config(video["tenant_id"])
+        config = get_tenant_config(tenant_id=tenant_id)
         
         # Check if tenant config exists and is active
         if not config:
@@ -313,7 +323,7 @@ async def process_videos(background_tasks: BackgroundTasks):
             continue
         
         # Check if faces are registered for this tenant
-        faces = list_face_records(video["tenant_id"])
+        faces = list_face_records(tenant_id=tenant_id)
         if not faces:
             update_video_status(video["video_id"], "no_faces")
             skipped_videos.append({"video_id": video["video_id"], "reason": "No employee faces registered"})
@@ -668,7 +678,7 @@ async def update_video(
             is_live=is_live,
             stream_url=stream_url,
             status=status,
-            filename=filename,
+            filename=final_path,
             s3_url=s3_url
         )
         
