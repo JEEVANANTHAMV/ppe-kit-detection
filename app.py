@@ -151,17 +151,31 @@ async def upload_video(
                 raise HTTPException(status_code=400, detail="Either file or s3_url is required")
             
             if s3_url:
-                # Download from S3
-                import boto3
-                s3 = boto3.client('s3')
-                bucket = os.getenv('S3_BUCKET', 'your-bucket')
-                key = s3_url.replace(f"s3://{bucket}/", "")
-                filename = os.path.basename(key)
-                temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
-                try:
-                    s3.download_file(bucket, key, temp_path)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                # Handle both S3 URLs and public URLs
+                if s3_url.startswith('s3://'):
+                    # Download from S3
+                    import boto3
+                    s3 = boto3.client('s3')
+                    bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                    key = s3_url.replace(f"s3://{bucket}/", "")
+                    filename = os.path.basename(key)
+                    temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                    try:
+                        s3.download_file(bucket, key, temp_path)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                else:
+                    # Download from public URL
+                    import requests
+                    filename = os.path.basename(s3_url)
+                    temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                    try:
+                        response = requests.get(s3_url)
+                        response.raise_for_status()
+                        with open(temp_path, 'wb') as f:
+                            f.write(response.content)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
             else:
                 filename = file.filename
                 temp_path = os.path.join(UPLOAD_DIR, filename)
@@ -432,23 +446,10 @@ def remove_config(tenant_id: str):
 ######################################################################
 # 5) Face Management Endpoints (CHANGED TO ACCEPT face_id IN REQUEST)
 ######################################################################
-class FaceCreate(BaseModel):
-    tenant_id: str
-    camera_id: str
-    name: str
-    face_id: Optional[str] = None
-    metadata: Optional[Dict] = None
-
-class FaceUpdate(BaseModel):
-    tenant_id: str
-    camera_id: str
-    name: Optional[str] = None
-    metadata: Optional[Dict] = None
 
 @app.post("/tenants/{tenant_id}/faces")
 async def add_face(
     tenant_id: str,
-    camera_id: str = Form(...),
     name: str = Form(...),
     face_id: str = Form(...),
     file: Optional[UploadFile] = File(None),
@@ -469,17 +470,30 @@ async def add_face(
         # Process image
         image_path = None
         if s3_url:
-            # Download from S3
-            import boto3
-            s3 = boto3.client('s3')
-            bucket = os.getenv('S3_BUCKET', 'your-bucket')
-            key = s3_url.replace(f"s3://{bucket}/", "")
+            # Handle both S3 URLs and public URLs
             image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
             os.makedirs(os.path.dirname(image_path), exist_ok=True)
-            try:
-                s3.download_file(bucket, key, image_path)
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+            
+            if s3_url.startswith('s3://'):
+                # Download from S3
+                import boto3
+                s3 = boto3.client('s3')
+                bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                key = s3_url.replace(f"s3://{bucket}/", "")
+                try:
+                    s3.download_file(bucket, key, image_path)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+            else:
+                # Download from public URL
+                import requests
+                try:
+                    response = requests.get(s3_url)
+                    response.raise_for_status()
+                    with open(image_path, 'wb') as f:
+                        f.write(response.content)
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
         else:
             # Save uploaded file
             image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
@@ -503,7 +517,6 @@ async def add_face(
         # Add face record
         face_id = add_face_record(
             tenant_id=tenant_id,
-            camera_id=camera_id,
             face_id=face_id,
             name=name,
             embedding=json.dumps(embedding),
@@ -532,7 +545,6 @@ def list_faces_endpoint(tenant_id: str):
 async def update_face(
     tenant_id: str,
     face_id: str,
-    camera_id: str = Form(...),
     name: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     s3_url: Optional[str] = Form(None),
@@ -551,17 +563,30 @@ async def update_face(
                 raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both.")
 
             if s3_url:
-                # Download from S3
-                import boto3
-                s3 = boto3.client('s3')
-                bucket = os.getenv('S3_BUCKET', 'your-bucket')
-                key = s3_url.replace(f"s3://{bucket}/", "")
+                # Handle both S3 URLs and public URLs
                 image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
                 os.makedirs(os.path.dirname(image_path), exist_ok=True)
-                try:
-                    s3.download_file(bucket, key, image_path)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                
+                if s3_url.startswith('s3://'):
+                    # Download from S3
+                    import boto3
+                    s3 = boto3.client('s3')
+                    bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                    key = s3_url.replace(f"s3://{bucket}/", "")
+                    try:
+                        s3.download_file(bucket, key, image_path)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                else:
+                    # Download from public URL
+                    import requests
+                    try:
+                        response = requests.get(s3_url)
+                        response.raise_for_status()
+                        with open(image_path, 'wb') as f:
+                            f.write(response.content)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
             else:
                 # Save uploaded file
                 image_path = os.path.join(UPLOAD_DIR, f"faces/{face_id}.jpg")
@@ -585,7 +610,6 @@ async def update_face(
         update_face_record_helper(
             face_id=face_id,
             tenant_id=tenant_id,
-            camera_id=camera_id,
             name=name,
             embedding=embedding,
             metadata=metadata_json,
@@ -641,17 +665,31 @@ async def update_video(
                 raise HTTPException(status_code=400, detail="Provide either file or s3_url, not both")
             
             if s3_url:
-                # Download from S3
-                import boto3
-                s3 = boto3.client('s3')
-                bucket = os.getenv('S3_BUCKET', 'your-bucket')
-                key = s3_url.replace(f"s3://{bucket}/", "")
-                filename = os.path.basename(key)
-                temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
-                try:
-                    s3.download_file(bucket, key, temp_path)
-                except Exception as e:
-                    raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                # Handle both S3 URLs and public URLs
+                if s3_url.startswith('s3://'):
+                    # Download from S3
+                    import boto3
+                    s3 = boto3.client('s3')
+                    bucket = os.getenv('S3_BUCKET', 'your-bucket')
+                    key = s3_url.replace(f"s3://{bucket}/", "")
+                    filename = os.path.basename(key)
+                    temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                    try:
+                        s3.download_file(bucket, key, temp_path)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from S3: {str(e)}")
+                else:
+                    # Download from public URL
+                    import requests
+                    filename = os.path.basename(s3_url)
+                    temp_path = os.path.join(UPLOAD_DIR, f"temp_{filename}")
+                    try:
+                        response = requests.get(s3_url)
+                        response.raise_for_status()
+                        with open(temp_path, 'wb') as f:
+                            f.write(response.content)
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
             else:
                 filename = file.filename
                 temp_path = os.path.join(UPLOAD_DIR, filename)

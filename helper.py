@@ -491,19 +491,14 @@ def update_tenant_status(tenant_id: str, is_active: bool):
     conn.close()
 
 # ----------------- Faces Table Operations ----------------- #
-def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, embedding: str, metadata: str = None, image_path: str = None, s3_url: str = None) -> str:
+def add_face_record(tenant_id: str, face_id: str, name: str, embedding: str, metadata: str = None, image_path: str = None, s3_url: str = None) -> str:
     """
     Adds a new face record to the database.
-    Validates that the camera exists for the tenant before adding the face.
     Returns the face_id if successful.
     """
     conn, db_type = get_connection()
     c = conn.cursor()
     try:
-        # First verify that the camera exists for this tenant
-        if not check_camera_exists(tenant_id, camera_id):
-            raise ValueError(f"Camera {camera_id} does not exist for tenant {tenant_id}")
-
         # Check if face_id already exists
         c.execute(format_query("SELECT face_id FROM faces WHERE face_id = ?", db_type), (face_id,))
         if c.fetchone():
@@ -511,10 +506,10 @@ def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, emb
 
         # Insert the new face record
         query = """
-        INSERT INTO faces (face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO faces (face_id, tenant_id, name, embedding, metadata, image_path, s3_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        c.execute(format_query(query, db_type), (face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url))
+        c.execute(format_query(query, db_type), (face_id, tenant_id, name, embedding, metadata, image_path, s3_url))
         conn.commit()
         return face_id
     except Exception as e:
@@ -523,23 +518,18 @@ def add_face_record(tenant_id: str, camera_id: str, face_id: str, name: str, emb
     finally:
         conn.close()
 
-def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str = None, embedding: str = None, metadata: str = None, image_path: str = None, s3_url: str = None) -> bool:
+def update_face_record(face_id: str, tenant_id: str, name: str = None, embedding: str = None, metadata: str = None, image_path: str = None, s3_url: str = None) -> bool:
     """
     Updates an existing face record in the database.
-    Validates that the camera exists for the tenant before updating the face.
     Returns True if successful.
     """
     conn, db_type = get_connection()
     c = conn.cursor()
     try:
-        # First verify that the camera exists for this tenant
-        if not check_camera_exists(tenant_id, camera_id):
-            raise ValueError(f"Camera {camera_id} does not exist for tenant {tenant_id}")
-
         # Check if face exists
-        c.execute(format_query("SELECT face_id FROM faces WHERE face_id = ?", db_type), (face_id,))
+        c.execute(format_query("SELECT face_id FROM faces WHERE face_id = ? AND tenant_id = ?", db_type), (face_id, tenant_id))
         if not c.fetchone():
-            raise ValueError(f"Face ID {face_id} does not exist")
+            raise ValueError(f"Face ID {face_id} does not exist for tenant {tenant_id}")
 
         # Build update query dynamically based on provided fields
         update_fields = []
@@ -563,20 +553,20 @@ def update_face_record(face_id: str, tenant_id: str, camera_id: str, name: str =
         if not update_fields:
             return True  # No fields to update
 
-        # Add tenant_id and camera_id to params
-        params.extend([tenant_id, camera_id, face_id])
+        # Add tenant_id and face_id to params
+        params.extend([tenant_id, face_id])
         
         query = f"""
         UPDATE faces 
         SET {', '.join(update_fields)}
-        WHERE tenant_id = ? AND camera_id = ? AND face_id = ?
+        WHERE tenant_id = ? AND face_id = ?
         """
         
         c.execute(format_query(query, db_type), params)
         conn.commit()
         
         if c.rowcount == 0:
-            raise ValueError(f"No face found with ID {face_id} for tenant {tenant_id} and camera {camera_id}")
+            raise ValueError(f"No face found with ID {face_id} for tenant {tenant_id}")
             
         return True
     except Exception as e:
@@ -596,7 +586,7 @@ def delete_face_record(face_id, tenant_id):
 def list_face_records(tenant_id):
     conn, db_type = get_connection()
     c = conn.cursor()
-    query = "SELECT face_id, camera_id, name, embedding, metadata, image_path, s3_url FROM faces WHERE tenant_id = ?"
+    query = "SELECT face_id, name, embedding, metadata, image_path, s3_url FROM faces WHERE tenant_id = ?"
     c.execute(format_query(query, db_type), (tenant_id,))
     rows = c.fetchall()
     conn.close()
@@ -604,34 +594,13 @@ def list_face_records(tenant_id):
     for row in rows:
         faces.append({
             "face_id": row[0],
-            "camera_id": row[1],
-            "name": row[2],
-            "embedding": json.loads(row[3]),
-            "metadata": json.loads(row[4]) if row[4] else None,
-            "image_path": row[5],
-            "s3_url": row[6]
+            "name": row[1],
+            "embedding": json.loads(row[2]),
+            "metadata": json.loads(row[3]) if row[3] else None,
+            "image_path": row[4],
+            "s3_url": row[5]
         })
     return faces
-
-def get_face_record(face_id: str):
-    conn, db_type = get_connection()
-    c = conn.cursor()
-    query = "SELECT face_id, tenant_id, camera_id, name, embedding, metadata, image_path, s3_url FROM faces WHERE face_id = ?"
-    c.execute(format_query(query, db_type), (face_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "face_id": row[0],
-            "tenant_id": row[1],
-            "camera_id": row[2],
-            "name": row[3],
-            "embedding": json.loads(row[4]),
-            "metadata": json.loads(row[5]) if row[5] else None,
-            "image_path": row[6],
-            "s3_url": row[7]
-        }
-    return None
 
 # ----------------- Violations Table Operations ----------------- #
 def save_violation_to_db(

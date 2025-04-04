@@ -2,6 +2,7 @@ import os
 import sqlite3
 import psycopg2
 from dotenv import load_dotenv
+import logging
 
 # Load environment variables
 load_dotenv()
@@ -34,37 +35,47 @@ def format_query(query, db_type):
     return query
 
 def migrate():
-    """Run all migrations in sequence"""
+    """Run database migrations"""
+    conn, db_type = get_connection()
+    cursor = conn.cursor()
+    
     try:
-        # Create tables if they don't exist
-        create_tables()
-        
-        # Add s3_url column to videos table if it doesn't exist
-        conn, db_type = get_connection()
-        cursor = conn.cursor()
-        
-        # Check if s3_url column exists
+        # Check if s3_url column exists in videos table
         cursor.execute("""
             SELECT column_name 
             FROM information_schema.columns 
             WHERE table_name = 'videos' AND column_name = 's3_url'
         """)
-        
         if not cursor.fetchone():
-            # Add s3_url column
+            # Add s3_url column to videos table
             cursor.execute("""
                 ALTER TABLE videos 
                 ADD COLUMN s3_url TEXT
             """)
-            print("Added s3_url column to videos table")
+            logging.info("Added s3_url column to videos table")
+        
+        # Check if camera_id column exists in faces table
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'faces' AND column_name = 'camera_id'
+        """)
+        if cursor.fetchone():
+            # Remove camera_id column from faces table
+            cursor.execute("""
+                ALTER TABLE faces 
+                DROP COLUMN camera_id
+            """)
+            logging.info("Removed camera_id column from faces table")
         
         conn.commit()
-        conn.close()
-        
-        print("All migrations completed successfully")
+        logging.info("Database migration completed successfully")
     except Exception as e:
-        print(f"Error during migration: {str(e)}")
+        conn.rollback()
+        logging.error(f"Error during migration: {str(e)}")
         raise
+    finally:
+        conn.close()
 
 def create_tables():
     # Database connection already established with environment variables
